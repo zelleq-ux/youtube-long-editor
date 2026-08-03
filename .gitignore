@@ -7,4 +7,5 @@ data/transcripts/*
 data/cuts/*
 data/chapters/*
 data/output/*
+data/pipeline.db
 !data/**/.gitkeep

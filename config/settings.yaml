@@ -10,6 +10,7 @@ transcribe:
   whisper_model: medium
   device: auto
   language: es
+  vad_filter: true               # filtra tramos sin voz antes de transcribir; evita alucinaciones de Whisper en silencios largos
 
 detect_cuts:
   silence_min_seconds: 0.8       # duración mínima de silencio para considerarlo candidato

@@ -15,6 +15,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from src.common import db
 from src.common.config import REPO_ROOT, load_config
 
 logger = logging.getLogger(__name__)
@@ -231,6 +232,10 @@ def run(video_id: str, config: dict, *, local_path: str) -> dict:
         "Ingesta completa: video_id=%s raw_path=%s duration_s=%.2f",
         video_id, output_path, duration_s,
     )
+
+    # Solo se marca como "ingested" una vez el re-encode de ffmpeg ha
+    # terminado con éxito (comprobación de returncode más arriba).
+    db.set_status(video_id, "ingested")
 
     return {
         "video_id": video_id,
