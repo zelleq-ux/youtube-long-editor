@@ -1,0 +1,29 @@
+paths:
+  raw: data/raw
+  transcripts: data/transcripts
+  cuts: data/cuts
+  chapters: data/chapters
+  output: data/output
+  outro: assets/outro/outro.mp4
+
+transcribe:
+  whisper_model: medium
+  device: auto
+  language: es
+
+detect_cuts:
+  silence_min_seconds: 0.8       # duración mínima de silencio para considerarlo candidato
+  silence_db_threshold: -35      # umbral de energía de audio (dB) por debajo del cual se considera silencio
+  motion_threshold: 0.15         # por debajo de esto = "quietud visual" (0.0-1.0, mismo rango que newclips)
+  filler_words: [eh, esto, o sea, bueno bueno]
+  cut_margin_seconds: 0.2        # margen de seguridad que se deja sin cortar alrededor del tramo detectado
+
+detect_chapters:
+  claude_model: claude-sonnet-5
+  min_chapter_seconds: 120        # no generar capítulos más cortos que esto
+
+edit:
+  cut_zoom_factor: 1.08
+  cut_zoom_duration_seconds: 0.4
+  loudnorm: true
+  append_outro: true
