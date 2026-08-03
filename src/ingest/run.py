@@ -151,6 +151,36 @@ def run(video_id: str, config: dict, *, local_path: str) -> dict:
         width, height, f"{fps:.3f}" if fps else "?", duration_s, len(audio_streams),
     )
 
+    # Frame rate objetivo para forzar CFR (frame rate constante). Se usa
+    # r_frame_rate (el nominal declarado por el contenedor/stream, p.ej.
+    # "30000/1001" o "60/1") en vez de avg_frame_rate: en una grabación VFR
+    # de OBS el promedio real puede ser algo como 59.87fps aunque el valor
+    # nominal configurado sea 60fps, y para un -r de salida interesa el
+    # nominal, no el promedio observado. Se conserva la cadena original de
+    # ffprobe (sin pasar por float) para no introducir artefactos de
+    # redondeo (p.ej. 29.969999999999999) al construir el argumento de ffmpeg.
+    r_frame_rate_raw = video_stream.get("r_frame_rate")
+    fps_cfr = _parse_frame_rate(r_frame_rate_raw)
+    # Cota de cordura: descarta valores <= 0 o absurdamente altos (stream
+    # malformado); en ese caso no se pasa -r y solo se fuerza -fps_mode cfr.
+    if fps_cfr is not None and not (0 < fps_cfr <= 300):
+        logger.warning(
+            "Frame rate nominal detectado (%s -> %.3f fps) fuera de rango razonable; "
+            "se ignora para -r y solo se fuerza -fps_mode cfr.",
+            r_frame_rate_raw, fps_cfr,
+        )
+        fps_cfr = None
+        r_frame_rate_raw = None
+
+    if fps_cfr is None:
+        logger.warning(
+            "No se pudo determinar un frame rate nominal fiable para forzar CFR "
+            "(r_frame_rate=%r); se fuerza CFR con -fps_mode cfr sin -r explícito.",
+            r_frame_rate_raw,
+        )
+    else:
+        logger.info("Frame rate objetivo para CFR (-r): %s (%.3f fps)", r_frame_rate_raw, fps_cfr)
+
     raw_dir.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
         logger.warning("El archivo de salida ya existe y va a ser sobrescrito: %s", output_path)
@@ -161,6 +191,15 @@ def run(video_id: str, config: dict, *, local_path: str) -> dict:
     # frame y optical flow, así que interesa un archivo limpio y uniformemente
     # codificado en vez de conservar el códec/GOP original de OBS. Se mantiene
     # resolución y orientación originales (no se recorta ni redimensiona).
+    #
+    # Se fuerza además CFR (frame rate constante) con -fps_mode cfr (más
+    # -r con el nominal detectado cuando se conoce): una grabación VFR de
+    # OBS tiene intervalos entre frames irregulares, y detect_cuts hace
+    # cortes exactos por frame + optical flow asumiendo un mapeo uniforme
+    # entre tiempo y número de frame. Con VFR ese mapeo se desvía y los
+    # timestamps de la transcripción/cortes dejan de corresponder al frame
+    # real, así que aquí se normaliza a CFR para que las siguientes etapas
+    # trabajen sobre una base temporal fiable.
     cmd = [
         "ffmpeg", "-y",
         "-i", str(input_path),
@@ -170,6 +209,11 @@ def run(video_id: str, config: dict, *, local_path: str) -> dict:
         "-crf", "20",
         "-preset", "medium",
         "-pix_fmt", "yuv420p",
+    ]
+    if fps_cfr is not None:
+        cmd += ["-r", str(r_frame_rate_raw)]
+    cmd += ["-fps_mode", "cfr"]
+    cmd += [
         "-c:a", "aac",
         "-ar", "48000",
         "-ac", "2",
