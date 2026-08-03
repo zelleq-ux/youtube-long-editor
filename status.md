@@ -2,7 +2,7 @@
 
 | Módulo            | Implementado | Validado end-to-end | Notas |
 |--------------------|:---:|:---:|-------|
-| ingest             | ❌ | ❌ | Pendiente — reutilizar base de newclips-viral-pipeline (adaptado a --file, sin yt-dlp por ahora ya que la fuente es OBS local) |
+| ingest             | ✅ | ❌ | Implementado con ffmpeg/ffprobe vía subprocess (re-encode H.264/AAC, sin crop/rescale). Validado con un clip sintético (1920x1080@30fps, 5s, generado con lavfi testsrc2+sine) mediante la CLI real (`python -m src.ingest.run`); no probado aún contra una grabación real de OBS de 1-2h |
 | transcribe         | ❌ | ❌ | Pendiente — mismo enfoque que newclips-viral-pipeline (faster-whisper) |
 | detect_cuts        | ❌ | ❌ | Pendiente — combina silencio de audio + optical flow + muletillas de transcripción |
 | detect_chapters    | ❌ | ❌ | Pendiente — bloques temáticos vía LLM sobre la transcripción |
@@ -19,5 +19,6 @@
 
 ## Próximo paso
 
-Implementar `src/ingest/run.py` y `src/transcribe/run.py`, reutilizando el
-código ya validado en `newclips-viral-pipeline` como base.
+Implementar `src/transcribe/run.py` (faster-whisper sobre
+`data/raw/<video_id>.mp4`), reutilizando el código ya validado en
+`newclips-viral-pipeline` como base.
