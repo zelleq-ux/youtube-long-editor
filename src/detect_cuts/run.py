@@ -34,13 +34,22 @@ una vez por candidato, y con un GOP largo (keyint por defecto de x264,
 ~250 frames) cada seek forzaba redecodificar desde el keyframe anterior:
 con 137 candidatos eso se tradujo en ~58 minutos sobre un vídeo de 9
 minutos. El recorrido único es O(duración del vídeo) una sola vez.
+
+Fiabilidad del filtro de movimiento en grabaciones de 1-2h (progreso
+visible, checkpointing reanudable, y detección de cuelgues silenciosos de
+cv2.VideoCapture en Windows vía un watchdog con timeout): ver el docstring
+de compute_motion_timeseries.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import os
+import queue
 import re
+import threading
+import time
 from pathlib import Path
 
 import cv2
@@ -64,13 +73,47 @@ _SILENCE_HOP_LENGTH = 512
 # acción sostenida en un tramo.
 _MOTION_SAMPLE_INTERVAL_SECONDS = 0.3
 
-# Magnitud de flujo óptico (px/frame, percentil 90 entre frames muestreados)
-# a partir de la cual se considera "movimiento máximo" (score -> 1.0). Es una
-# cota heurística (no hay referencia exacta del proyecto hermano en este
-# repo) elegida para que quietud real de cámara/escritorio caiga muy por
-# debajo de motion_threshold (0.15 por defecto) y cualquier acción visible
-# en pantalla lo supere con margen.
+# Magnitud de flujo óptico (px/frame equivalente a resolución original,
+# percentil 90 entre frames muestreados) a partir de la cual se considera
+# "movimiento máximo" (score -> 1.0). Es una cota heurística (no hay
+# referencia exacta del proyecto hermano en este repo) elegida para que
+# quietud real de cámara/escritorio caiga muy por debajo de
+# motion_threshold (0.15 por defecto) y cualquier acción visible en
+# pantalla lo supere con margen.
 _MOTION_NORM_MAGNITUDE_PX = 4.0
+
+# Altura (px) a la que se reescala cada frame ANTES de calcular optical
+# flow (preservando el aspect ratio; nunca se hace upscale si el vídeo ya
+# es más pequeño que esto). Para "hay movimiento sí/no" no hace falta
+# precisión a resolución completa, y el coste de Farneback escala con el
+# nº de píxeles: un 1920x1080 reescalado a 480p analiza ~1/5 de los
+# píxeles (1080/480 al cuadrado ≈ 5.06x menos trabajo). La magnitud medida
+# a la resolución reducida se reescala de vuelta a equivalente-resolución-
+# original (dividiendo por el mismo factor de escala) antes de guardarla,
+# así que _MOTION_NORM_MAGNITUDE_PX y score_motion_segment no necesitan
+# ningún cambio.
+_MOTION_ANALYSIS_HEIGHT_PX = 480
+
+# Cada cuántas muestras (o segundos de pared, lo que ocurra antes) se
+# loguea el progreso del cálculo de movimiento visual. Mismo patrón que
+# transcribe/run.py: en una grabación de 1-2h un proceso silencioso durante
+# horas sería inaceptable.
+_MOTION_PROGRESS_EVERY_SAMPLES = 50
+_MOTION_PROGRESS_EVERY_SECONDS = 30.0
+
+# Si no llega ninguna muestra nueva durante este tiempo, se asume que
+# cv2.VideoCapture se ha quedado colgado (ver docstring de
+# compute_motion_timeseries) y se aborta con un error claro en vez de
+# esperar indefinidamente. Una muestra normal tarda del orden de
+# milisegundos a un par de segundos; 120s es ya ~100x ese margen.
+_MOTION_STALL_TIMEOUT_SECONDS = 120.0
+
+# Checkpointing: cada cuántas muestras se guarda el progreso parcial a
+# disco. Si no se puede estimar el nº total de muestras (p.ej.
+# CAP_PROP_FRAME_COUNT poco fiable para el contenedor), se usa este valor
+# fijo como fallback (≈500 muestras * 0.3s ≈ 150s de vídeo entre
+# checkpoints).
+_MOTION_CHECKPOINT_FALLBACK_EVERY_SAMPLES = 500
 
 _WORD_CLEAN_RE = re.compile(r"[^\w]+", re.UNICODE)
 
@@ -185,47 +228,148 @@ def detect_silence_segments(video_id: str, config: dict) -> list[dict]:
     return segments
 
 
-def compute_motion_timeseries(video_id: str, config: dict) -> tuple[np.ndarray, np.ndarray]:
+def _motion_checkpoint_path(video_id: str, config: dict) -> Path:
+    return (REPO_ROOT / config["paths"]["cuts"]).resolve() / video_id / "_motion_checkpoint.npz"
+
+
+def _save_motion_checkpoint(
+    checkpoint_path: Path,
+    times: list[float],
+    magnitudes: list[float],
+    frame_idx: int,
+    next_sample_frame: int,
+    video_stat: os.stat_result,
+) -> None:
     """
-    Recorre data/raw/<video_id>.mp4 UNA sola vez, de principio a fin y sin
-    seeks, calculando la magnitud (sin normalizar) de optical flow denso
-    (Farneback) entre pares de frames consecutivos muestreados cada
-    _MOTION_SAMPLE_INTERVAL_SECONDS. Los frames que no forman parte de un
-    par muestreado se saltan con cap.grab() (sin decodificar/copiar su
-    imagen), así que el coste total es un único paso secuencial sobre el
-    vídeo en vez de un seek por candidato.
-
-    Returns:
-        (times, magnitudes): dos np.ndarray 1D del mismo tamaño (vacíos si
-        el vídeo no se pudo abrir o leer). times[i] es el instante en
-        segundos del primer frame del par i; magnitudes[i] es la magnitud
-        media (spatial mean, sin normalizar) del flujo óptico entre ese
-        frame y el siguiente.
+    Guarda el progreso parcial del cálculo de movimiento visual, para poder
+    reanudar sin recalcular desde cero si el proceso se interrumpe (Ctrl+C,
+    kill, cuelgue detectado por el watchdog...). Escribe a un archivo
+    temporal y hace un rename atómico, para no dejar un checkpoint a medio
+    escribir si el proceso muere justo durante el guardado.
     """
-    input_path = _raw_video_path(video_id, config)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = checkpoint_path.with_name(checkpoint_path.stem + ".tmp.npz")
+    np.savez(
+        tmp_path,
+        times=np.asarray(times, dtype=np.float64),
+        magnitudes=np.asarray(magnitudes, dtype=np.float64),
+        frame_idx=np.asarray(frame_idx),
+        next_sample_frame=np.asarray(next_sample_frame),
+        video_mtime=np.asarray(video_stat.st_mtime),
+        video_size=np.asarray(video_stat.st_size),
+        sample_interval_seconds=np.asarray(_MOTION_SAMPLE_INTERVAL_SECONDS),
+        analysis_height_px=np.asarray(_MOTION_ANALYSIS_HEIGHT_PX),
+    )
+    os.replace(tmp_path, checkpoint_path)
 
-    cap = cv2.VideoCapture(str(input_path))
-    if not cap.isOpened():
-        logger.warning("No se pudo abrir %s para optical flow; serie de movimiento vacía.", input_path)
-        return np.array([]), np.array([])
 
-    times: list[float] = []
-    magnitudes: list[float] = []
+def _load_motion_checkpoint(checkpoint_path: Path, video_stat: os.stat_result) -> dict | None:
+    """
+    Carga un checkpoint previo si existe y es válido para este vídeo (mismo
+    tamaño/mtime, mismo intervalo de muestreo). None si no hay checkpoint o
+    está obsoleto/corrupto, en cuyo caso se recalcula desde cero.
+    """
+    if not checkpoint_path.exists():
+        return None
+    try:
+        # np.load sobre un .npz devuelve un NpzFile que mantiene el archivo
+        # zip abierto de forma perezosa hasta que se cierra explícitamente;
+        # sin el `with`, ese handle queda abierto en Windows y el próximo
+        # os.replace() al guardar un checkpoint nuevo sobre esta misma ruta
+        # falla con PermissionError ("Acceso denegado") porque el archivo
+        # sigue bloqueado por esta lectura.
+        with np.load(checkpoint_path) as data:
+            if (
+                float(data["video_mtime"]) != video_stat.st_mtime
+                or int(data["video_size"]) != video_stat.st_size
+            ):
+                logger.info(
+                    "Checkpoint de movimiento visual obsoleto (el vídeo de entrada cambió); "
+                    "se ignora y se recalcula desde cero."
+                )
+                return None
+            if float(data["sample_interval_seconds"]) != _MOTION_SAMPLE_INTERVAL_SECONDS:
+                logger.info(
+                    "Checkpoint de movimiento visual con un intervalo de muestreo distinto al actual; "
+                    "se ignora y se recalcula desde cero."
+                )
+                return None
+            # "analysis_height_px" no existía en checkpoints de versiones
+            # anteriores a la reducción de resolución para optical flow;
+            # si falta, es un checkpoint viejo y se descarta (las
+            # magnitudes que contendría no serían comparables con las que
+            # se calcularían ahora a resolución reducida).
+            if "analysis_height_px" not in data or int(data["analysis_height_px"]) != _MOTION_ANALYSIS_HEIGHT_PX:
+                logger.info(
+                    "Checkpoint de movimiento visual de una versión anterior (resolución de análisis "
+                    "distinta); se ignora y se recalcula desde cero."
+                )
+                return None
+            return {
+                "times": list(data["times"]),
+                "magnitudes": list(data["magnitudes"]),
+                "frame_idx": int(data["frame_idx"]),
+                "next_sample_frame": int(data["next_sample_frame"]),
+            }
+    except Exception as exc:  # noqa: BLE001 - un checkpoint corrupto no debe tumbar el análisis
+        logger.warning(
+            "No se pudo leer el checkpoint de movimiento visual (%s); se recalcula desde cero.", exc
+        )
+        return None
+
+
+def _motion_worker(
+    video_path: str,
+    frame_idx: int,
+    next_sample_frame: int,
+    interval_frames: int,
+    fps: float,
+    analysis_size: tuple[int, int] | None,
+    magnitude_scale_correction: float,
+    out_queue: "queue.Queue",
+    stop_event: threading.Event,
+) -> None:
+    """
+    Recorre el vídeo en un hilo aparte, publicando cada muestra calculada
+    en out_queue, para que el hilo principal pueda aplicar un timeout de
+    "sin progreso" sin bloquearse en la llamada nativa de cv2 (ver
+    docstring de compute_motion_timeseries: cv2.VideoCapture puede
+    colgarse en Windows sin usar CPU/disco de forma visible, y un hilo
+    bloqueado en una llamada nativa no se puede interrumpir de forma
+    segura desde Python — lo único que puede hacer el hilo principal es
+    dejar de esperarlo y fallar con un diagnóstico claro).
+
+    analysis_size: (ancho, alto) al que se reescala cada frame antes de
+    calcular optical flow (None si no hace falta reescalar, p.ej. el vídeo
+    ya es más pequeño que _MOTION_ANALYSIS_HEIGHT_PX). Farneback escala con
+    el nº de píxeles, así que reescalar antes reduce mucho el coste; la
+    magnitud resultante se multiplica por magnitude_scale_correction
+    (1/factor_de_escala) para que quede en unidades equivalentes a la
+    resolución original y _MOTION_NORM_MAGNITUDE_PX no necesite cambiar.
+    """
+    try:
+        # Backend FFMPEG explícito: usa libavcodec/libavformat directamente
+        # (el mismo motor que ya usa el propio pipeline de ingesta), en vez
+        # de fiarse de la auto-detección de backend de OpenCV. En Windows,
+        # backends alternativos como Media Foundation (MSMF) tienen cuelgues
+        # y fugas de recursos documentados en grabaciones largas; fijar
+        # FFMPEG explícitamente es una defensa barata aunque en este dev
+        # environment ya sea el backend por defecto.
+        cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            out_queue.put(("error", RuntimeError(f"No se pudo abrir {video_path} con el backend FFMPEG.")))
+            return
+    except Exception as exc:  # noqa: BLE001 - se reenvía al hilo principal
+        out_queue.put(("error", exc))
+        return
 
     try:
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if not fps or fps <= 0:
-            fps = 30.0
-        interval_frames = max(1, round(_MOTION_SAMPLE_INTERVAL_SECONDS * fps))
+        if frame_idx > 0:
+            if not cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx):
+                out_queue.put(("error", RuntimeError(f"No se pudo reanudar en el frame {frame_idx}.")))
+                return
 
-        logger.info(
-            "Calculando serie de movimiento visual (optical flow, muestreo cada %.2fs)...",
-            _MOTION_SAMPLE_INTERVAL_SECONDS,
-        )
-
-        frame_idx = 0
-        next_sample_frame = 0
-        while True:
+        while not stop_event.is_set():
             if frame_idx >= next_sample_frame:
                 ok_a, frame_a = cap.read()
                 if not ok_a:
@@ -240,22 +384,195 @@ def compute_motion_timeseries(video_id: str, config: dict) -> tuple[np.ndarray, 
 
                 gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY)
                 gray_b = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY)
+                if analysis_size is not None:
+                    gray_a = cv2.resize(gray_a, analysis_size, interpolation=cv2.INTER_AREA)
+                    gray_b = cv2.resize(gray_b, analysis_size, interpolation=cv2.INTER_AREA)
                 flow = cv2.calcOpticalFlowFarneback(
                     gray_a, gray_b, None, 0.5, 3, 15, 3, 5, 1.2, 0
                 )
                 magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-
-                times.append(idx_a / fps)
-                magnitudes.append(float(np.mean(magnitude)))
+                mag_full_res_equiv = float(np.mean(magnitude)) * magnitude_scale_correction
 
                 next_sample_frame = idx_a + interval_frames
+                out_queue.put(("sample", (idx_a / fps, mag_full_res_equiv, frame_idx, next_sample_frame)))
             else:
                 if not cap.grab():
                     break
                 frame_idx += 1
+        out_queue.put(("done", None))
+    except Exception as exc:  # noqa: BLE001 - se reenvía al hilo principal
+        out_queue.put(("error", exc))
     finally:
         cap.release()
 
+
+def compute_motion_timeseries(video_id: str, config: dict) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Recorre data/raw/<video_id>.mp4 UNA sola vez, de principio a fin y sin
+    seeks, calculando la magnitud (sin normalizar) de optical flow denso
+    (Farneback) entre pares de frames consecutivos muestreados cada
+    _MOTION_SAMPLE_INTERVAL_SECONDS. Los frames que no forman parte de un
+    par muestreado se saltan con cap.grab() (sin decodificar/copiar su
+    imagen), así que el coste total es un único paso secuencial sobre el
+    vídeo en vez de un seek por candidato.
+
+    Cada frame se reescala a _MOTION_ANALYSIS_HEIGHT_PX de alto (preservando
+    aspect ratio, sin upscale) antes de calcular optical flow: Farneback
+    escala con el nº de píxeles, y para clasificar "hay movimiento sí/no"
+    no hace falta la resolución completa. La magnitud se reescala de vuelta
+    a equivalente-resolución-original antes de guardarse, así que
+    _MOTION_NORM_MAGNITUDE_PX sigue siendo válido sin cambios.
+
+    Fiabilidad en grabaciones largas (1-2h):
+
+    - Progreso visible: loguea cada _MOTION_PROGRESS_EVERY_SAMPLES muestras
+      o _MOTION_PROGRESS_EVERY_SECONDS de reloj (lo que ocurra antes),
+      igual que transcribe/run.py.
+    - Checkpointing: guarda el progreso parcial a
+      data/cuts/<video_id>/_motion_checkpoint.npz aproximadamente cada 10%
+      del total estimado de muestras (o cada
+      _MOTION_CHECKPOINT_FALLBACK_EVERY_SAMPLES si no se puede estimar el
+      total). Si el proceso se interrumpe, la siguiente ejecución reanuda
+      desde ahí en vez de recalcular desde cero. El checkpoint se borra al
+      terminar con éxito.
+    - Cuelgues silenciosos: cv2.VideoCapture es conocido por colgarse en
+      Windows sin actividad visible de CPU/disco — no es solo un problema
+      del backend Media Foundation (MSMF), que tiene fugas/cuelgues
+      documentados en grabaciones largas; también se ha visto (y no se
+      puede descartar aquí) con el propio backend FFMPEG si su pool de
+      hilos interno de decodificación se bloquea entre sí, o si un
+      antivirus/EDR intercepta la lectura secuencial de un archivo grande
+      y la va pausando. Ninguna de estas causas es solucionable desde
+      Python puro (no hay forma segura de matar un hilo bloqueado en una
+      llamada nativa). Por eso el recorrido del vídeo se hace en un hilo
+      aparte (_motion_worker) que va publicando cada muestra en una cola;
+      el hilo principal aplica un timeout de _MOTION_STALL_TIMEOUT_SECONDS
+      a la espera de la siguiente muestra — si se agota, se asume un
+      cuelgue real (una muestra normal tarda milisegundos, no minutos) y
+      se levanta un error con diagnóstico claro en vez de esperar en
+      silencio para siempre; el checkpoint ya guardado permite reanudar.
+      (Si el antivirus resulta ser la causa, excluir la carpeta data/raw
+      del escaneo en tiempo real es la mitigación fuera de este código.)
+
+    Returns:
+        (times, magnitudes): dos np.ndarray 1D del mismo tamaño (vacíos si
+        el vídeo no se pudo abrir o leer). times[i] es el instante en
+        segundos del primer frame del par i; magnitudes[i] es la magnitud
+        media (spatial mean, sin normalizar) del flujo óptico entre ese
+        frame y el siguiente.
+    """
+    input_path = _raw_video_path(video_id, config)
+    video_stat = input_path.stat()
+    checkpoint_path = _motion_checkpoint_path(video_id, config)
+
+    resume = _load_motion_checkpoint(checkpoint_path, video_stat)
+    if resume:
+        times, magnitudes = resume["times"], resume["magnitudes"]
+        start_frame_idx, start_next_sample = resume["frame_idx"], resume["next_sample_frame"]
+        logger.info(
+            "Reanudando cálculo de movimiento visual desde checkpoint: %d muestra(s) ya calculada(s) "
+            "(hasta %.1fs de vídeo).",
+            len(times), times[-1] if times else 0.0,
+        )
+    else:
+        times, magnitudes = [], []
+        start_frame_idx, start_next_sample = 0, 0
+
+    probe_cap = cv2.VideoCapture(str(input_path), cv2.CAP_FFMPEG)
+    if not probe_cap.isOpened():
+        probe_cap.release()
+        logger.warning("No se pudo abrir %s para optical flow; serie de movimiento vacía.", input_path)
+        return np.array([]), np.array([])
+    fps = probe_cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 0:
+        fps = 30.0
+    total_frames = probe_cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    orig_width = int(probe_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_height = int(probe_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    probe_cap.release()
+
+    if orig_height > _MOTION_ANALYSIS_HEIGHT_PX > 0:
+        magnitude_scale_correction = orig_height / _MOTION_ANALYSIS_HEIGHT_PX
+        analysis_width = max(1, round(orig_width / magnitude_scale_correction))
+        analysis_size = (analysis_width, _MOTION_ANALYSIS_HEIGHT_PX)
+    else:
+        magnitude_scale_correction = 1.0
+        analysis_size = None
+
+    interval_frames = max(1, round(_MOTION_SAMPLE_INTERVAL_SECONDS * fps))
+    # CAP_PROP_FRAME_COUNT puede ser poco fiable según el contenedor; solo
+    # se usa como estimación best-effort para el % de progreso y la
+    # cadencia de checkpoints, nunca para lógica de corrección.
+    expected_samples = int(total_frames / interval_frames) if total_frames and total_frames > 0 else None
+    checkpoint_every = max(1, expected_samples // 10) if expected_samples else _MOTION_CHECKPOINT_FALLBACK_EVERY_SAMPLES
+
+    logger.info(
+        "Calculando serie de movimiento visual (optical flow, muestreo cada %.2fs, análisis a %s%s)...",
+        _MOTION_SAMPLE_INTERVAL_SECONDS,
+        f"{analysis_size[0]}x{analysis_size[1]}" if analysis_size else f"{orig_width}x{orig_height} (sin reescalar)",
+        f", ~{expected_samples} muestra(s) esperada(s)" if expected_samples else "",
+    )
+
+    out_queue: "queue.Queue" = queue.Queue()
+    stop_event = threading.Event()
+    worker = threading.Thread(
+        target=_motion_worker,
+        args=(
+            str(input_path), start_frame_idx, start_next_sample, interval_frames, fps,
+            analysis_size, magnitude_scale_correction, out_queue, stop_event,
+        ),
+        daemon=True,
+    )
+    worker.start()
+
+    inicio = time.monotonic()
+    ultimo_log = inicio
+    checkpoint_baseline = len(times)
+
+    try:
+        while True:
+            try:
+                kind, payload = out_queue.get(timeout=_MOTION_STALL_TIMEOUT_SECONDS)
+            except queue.Empty:
+                stop_event.set()
+                elapsed = time.monotonic() - inicio
+                raise RuntimeError(
+                    f"compute_motion_timeseries: sin progreso durante {_MOTION_STALL_TIMEOUT_SECONDS:.0f}s "
+                    f"({len(times)} muestra(s) calculada(s), última en {times[-1] if times else 0.0:.1f}s "
+                    f"de vídeo, {elapsed:.0f}s transcurridos en esta ejecución). Probable cuelgue de "
+                    "cv2.VideoCapture (ver docstring del módulo para causas conocidas en Windows). "
+                    f"El progreso está guardado en {checkpoint_path}; vuelve a ejecutar para reanudar "
+                    "desde ahí en vez de recalcular desde cero."
+                )
+
+            if kind == "error":
+                raise RuntimeError(f"Error calculando movimiento visual: {payload}") from payload
+            if kind == "done":
+                break
+
+            t, magnitude, frame_idx, next_sample_frame = payload
+            times.append(t)
+            magnitudes.append(magnitude)
+
+            ahora = time.monotonic()
+            if len(times) % _MOTION_PROGRESS_EVERY_SAMPLES == 0 or (ahora - ultimo_log) >= _MOTION_PROGRESS_EVERY_SECONDS:
+                pct = f" ({100 * len(times) / expected_samples:.1f}%)" if expected_samples else ""
+                logger.info(
+                    "Progreso movimiento visual: %d muestra(s)%s, última marca %.1fs de vídeo, "
+                    "%.1fs de proceso transcurridos",
+                    len(times), pct, t, ahora - inicio,
+                )
+                ultimo_log = ahora
+
+            if len(times) - checkpoint_baseline >= checkpoint_every:
+                _save_motion_checkpoint(checkpoint_path, times, magnitudes, frame_idx, next_sample_frame, video_stat)
+                checkpoint_baseline = len(times)
+                logger.debug("Checkpoint de movimiento visual guardado (%d muestras).", len(times))
+    finally:
+        stop_event.set()
+        worker.join(timeout=5.0)
+
+    checkpoint_path.unlink(missing_ok=True)
     logger.info("Serie de movimiento visual calculada: %d muestra(s)", len(times))
     return np.array(times), np.array(magnitudes)
 

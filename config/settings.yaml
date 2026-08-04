@@ -27,7 +27,17 @@ detect_chapters:
   min_chapter_seconds: 120        # no generar capítulos más cortos que esto
 
 edit:
-  cut_zoom_factor: 1.08
-  cut_zoom_duration_seconds: 0.4
+  long_speech_min_seconds: 10      # duración mínima (en el vídeo original) de un tramo de habla continua para
+                                    # aplicarle el zoom hacia la webcam
+  long_speech_gap_seconds: 1.2     # hueco máximo entre el fin de una palabra y el inicio de la siguiente para
+                                    # seguir considerándolas parte del mismo tramo de habla continua
+  long_speech_zoom_factor: 1.13    # escala a la que se queda el zoom durante el tramo; 1.0 = sin zoom
+  zoom_in_duration_seconds: 2.5    # duración de la rampa de entrada del zoom (subida lenta); al terminar el
+                                    # tramo se vuelve a 1.0 de golpe, sin rampa de salida
+  facecam_region:                  # posición aproximada (px, sobre el frame original) de la webcam del
+    x: 15                          # streamer, hacia la que se dirige el zoom; no hace falta que encuadre la
+    y: 400                         # cara con precisión, solo que el zoom se sienta dirigido hacia esa zona.
+    w: 365                         # Ajustar si cambia la disposición de la escena en OBS.
+    h: 210
   loudnorm: true
   append_outro: true

@@ -59,11 +59,25 @@ previa, confiando en los umbrales configurados. Aun así, `detect_cuts` debe
 loguear un resumen (nº de cortes, duración total eliminada) antes de que
 `edit/` los aplique, para que quede constancia en el log de ejecución.
 
-### Micro-zoom en los cortes
+### Zoom hacia la webcam en habla larga
 
-Cada corte aplicado en `edit/` lleva un pequeño zoom (config
-`edit.cut_zoom_factor`, por defecto ~1.06-1.10) durante ~0.3-0.5s alrededor
-del punto de corte, para disimular el salto en vez de un jump-cut seco.
+En vez de un micro-zoom en cada punto de corte, `edit/` aplica el zoom
+típico de streamer durante los tramos de habla continua de
+`edit.long_speech_min_seconds` segundos o más (por defecto 10s), derivados
+de `data/transcripts/<video_id>.json` agrupando palabras consecutivas cuyo
+hueco es menor que `edit.long_speech_gap_seconds` (por defecto 1.2s). El
+zoom sube lento y suave (curva coseno, sin saltos) desde 1.0 hasta
+`edit.long_speech_zoom_factor` (por defecto ~1.12-1.15) durante los
+primeros `edit.zoom_in_duration_seconds` (por defecto 2.5s) del tramo,
+dirigido hacia `edit.facecam_region` (posición aproximada x/y/w/h de la
+webcam sobre el frame original — no hace falta encuadrar la cara con
+precisión, solo que el zoom se sienta dirigido hacia ahí). SE QUEDA en ese
+zoom el resto del tramo (no vuelve a bajar gradualmente); al terminar el
+tramo CORTA SECO a 1.0 (salto instantáneo, no una transición). Los
+timestamps de la transcripción son del vídeo original, así que se
+remapean a la línea de tiempo ya cortada restando la duración acumulada de
+los cortes anteriores a cada punto — el mismo remapeo que hace falta para
+los capítulos, ver más abajo.
 
 ## Convenciones
 
