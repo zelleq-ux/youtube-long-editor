@@ -8,13 +8,16 @@ paths:
 
 transcribe:
   whisper_model: medium
-  device: auto
+  device: cpu
   language: es
   vad_filter: true               # filtra tramos sin voz antes de transcribir; evita alucinaciones de Whisper en silencios largos
 
 detect_cuts:
   silence_min_seconds: 0.8       # duración mínima de silencio para considerarlo candidato
   silence_db_threshold: -35      # umbral de energía de audio (dB) por debajo del cual se considera silencio
+  silence_onset_margin_db: 10    # umbral estricto = silence_db_threshold - esto; recorta los bordes de cada
+                                  # candidato a su núcleo de silencio profundo, para no comerse una voz que
+                                  # empieza floja y va subiendo de volumen hasta cruzar silence_db_threshold
   motion_threshold: 0.15         # por debajo de esto = "quietud visual" (0.0-1.0, mismo rango que newclips)
   filler_words: [eh, esto, o sea, bueno bueno]
   cut_margin_seconds: 0.2        # margen de seguridad que se deja sin cortar alrededor del tramo detectado

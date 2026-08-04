@@ -151,6 +151,21 @@ def run(video_id: str, config: dict, *, local_path: str) -> dict:
         "Detectado: %sx%s @ %s fps, duración %.2fs, %d pista(s) de audio",
         width, height, f"{fps:.3f}" if fps else "?", duration_s, len(audio_streams),
     )
+    if len(audio_streams) > 1:
+        # Solo se mapea la pista de audio 0 (-map 0:a:0, más abajo). Si OBS
+        # grabó varias pistas (p.ej. una con el mic propio y otra con el
+        # audio de Discord de un compañero de stream en un track separado),
+        # aquí se estarían descartando en silencio todas menos la primera:
+        # ese audio jamás llegaría a las siguientes etapas (transcripción,
+        # detect_cuts...). Se avisa explícitamente para que el usuario
+        # verifique qué pista es la 0 y si es la que quiere conservar.
+        logger.warning(
+            "El archivo de entrada tiene %d pistas de audio, pero solo se conserva la "
+            "pista 0 (índices ffprobe: %s). Si alguna de las otras pistas contiene audio "
+            "que quieres en el vídeo final (p.ej. un compañero de stream en un track "
+            "separado), ese audio se está descartando silenciosamente en la ingesta.",
+            len(audio_streams), [s.get("index") for s in audio_streams],
+        )
 
     # Frame rate objetivo para forzar CFR (frame rate constante). Se usa
     # r_frame_rate (el nominal declarado por el contenedor/stream, p.ej.

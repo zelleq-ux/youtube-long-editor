@@ -99,6 +99,25 @@ def detect_silence_segments(video_id: str, config: dict) -> list[dict]:
     dBFS), comparada contra config['detect_cuts']['silence_db_threshold'].
     Solo se devuelven tramos con duración >= config['detect_cuts']['silence_min_seconds'].
 
+    Dos detalles pensados para no comerse el arranque de una voz real:
+
+    1. Canales: se carga el audio SIN mezclar a mono (mono=False) y la
+       energía de cada frame es el MÁXIMO de la RMS entre canales, no la
+       media. Si el audio de un compañero de stream está paneado
+       predominantemente a un canal (p.ej. mic propio a la izquierda,
+       Discord del compañero a la derecha), una mezcla a mono diluye esa
+       voz (mono ≈ canal_activo / 2, unos -6dB de más) y puede mantenerla
+       por debajo de silence_db_threshold más tiempo del real.
+    2. Frontera de fin de silencio: además del umbral principal
+       (silence_db_threshold) que define los tramos candidatos, se aplica
+       un umbral más estricto (silence_db_threshold -
+       config['detect_cuts']['silence_onset_margin_db']) para recortar los
+       bordes de cada candidato hasta el último punto de silencio
+       "profundo" real. Una voz que empieza floja y va subiendo de volumen
+       puede tardar más de un segundo en cruzar el umbral principal; sin
+       este recorte, todo ese tramo de subida (que ya es voz real) queda
+       marcado como silencio recortable.
+
     Returns:
         [{"start": float, "end": float}, ...] ordenado por tiempo.
     """
@@ -107,13 +126,18 @@ def detect_silence_segments(video_id: str, config: dict) -> list[dict]:
     detect_cuts_config = config.get("detect_cuts", {})
     db_threshold = detect_cuts_config.get("silence_db_threshold", -35)
     min_seconds = detect_cuts_config.get("silence_min_seconds", 0.8)
+    onset_margin_db = detect_cuts_config.get("silence_onset_margin_db", 10.0)
+    strict_threshold = db_threshold - onset_margin_db
 
     logger.info("Cargando audio de %s para análisis de silencios...", input_path)
-    y, sr = librosa.load(str(input_path), sr=None, mono=True)
+    y, sr = librosa.load(str(input_path), sr=None, mono=False)
 
-    rms = librosa.feature.rms(
-        y=y, frame_length=_SILENCE_FRAME_LENGTH, hop_length=_SILENCE_HOP_LENGTH
-    )[0]
+    channels = y if y.ndim > 1 else y[np.newaxis, :]
+    channel_rms = [
+        librosa.feature.rms(y=ch, frame_length=_SILENCE_FRAME_LENGTH, hop_length=_SILENCE_HOP_LENGTH)[0]
+        for ch in channels
+    ]
+    rms = np.maximum.reduce(channel_rms)
     rms_db = librosa.amplitude_to_db(rms, ref=1.0)
     frame_times = librosa.frames_to_time(
         np.arange(len(rms_db)), sr=sr, hop_length=_SILENCE_HOP_LENGTH
@@ -121,19 +145,40 @@ def detect_silence_segments(video_id: str, config: dict) -> list[dict]:
 
     is_silent = rms_db < db_threshold
 
-    segments: list[dict] = []
-    seg_start: float | None = None
-    for t, silent in zip(frame_times, is_silent):
-        if silent and seg_start is None:
-            seg_start = float(t)
-        elif not silent and seg_start is not None:
-            seg_end = float(t)
-            if seg_end - seg_start >= min_seconds:
-                segments.append({"start": seg_start, "end": seg_end})
-            seg_start = None
+    # 1. Tramos candidatos "en bruto", con el umbral principal (como antes).
+    raw_runs: list[tuple[int, int]] = []
+    run_start: int | None = None
+    for i, silent in enumerate(is_silent):
+        if silent and run_start is None:
+            run_start = i
+        elif not silent and run_start is not None:
+            raw_runs.append((run_start, i))
+            run_start = None
+    if run_start is not None:
+        raw_runs.append((run_start, len(is_silent)))
 
-    if seg_start is not None:
-        seg_end = float(frame_times[-1] + _SILENCE_HOP_LENGTH / sr) if len(frame_times) else seg_start
+    # 2. Recorta cada candidato a su núcleo de silencio "profundo" (umbral
+    #    estricto), descartando colas donde la energía ya está subiendo
+    #    hacia una voz real aunque todavía no haya cruzado el umbral
+    #    principal. Nunca alarga un tramo, solo lo acorta o lo descarta.
+    segments: list[dict] = []
+    for i0, i1 in raw_runs:
+        start_idx = i0
+        while start_idx < i1 and rms_db[start_idx] >= strict_threshold:
+            start_idx += 1
+        end_idx = i1
+        while end_idx > start_idx and rms_db[end_idx - 1] >= strict_threshold:
+            end_idx -= 1
+
+        if end_idx <= start_idx:
+            continue  # ningún núcleo de silencio profundo dentro del candidato
+
+        seg_start = float(frame_times[start_idx])
+        if end_idx < len(frame_times):
+            seg_end = float(frame_times[end_idx])
+        else:
+            seg_end = float(frame_times[-1] + _SILENCE_HOP_LENGTH / sr) if len(frame_times) else seg_start
+
         if seg_end - seg_start >= min_seconds:
             segments.append({"start": seg_start, "end": seg_end})
 
