@@ -15,6 +15,6 @@ def load_config(path: str | Path = REPO_ROOT / "config" / "settings.yaml") -> di
     with open(path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     config["_env"] = {
-        "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY"),
+        "anthropic_api_key": os.getenv("NEWCLIPS_ANTHROPIC_API_KEY"),
     }
     return config
