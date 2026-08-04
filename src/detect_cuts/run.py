@@ -19,9 +19,21 @@ Guarda el resultado en data/cuts/<video_id>/cuts.json y loguea un resumen
 (nº de cortes, duración total eliminada) antes de que edit/ los aplique.
 
 Nota: el código de newclips-viral-pipeline no está disponible en este
-repo, así que score_motion_segment reimplementa aquí el enfoque descrito
+repo, así que el filtro de movimiento reimplementa aquí el enfoque descrito
 en CLAUDE.md (Farneback + magnitud de flujo normalizada 0.0-1.0) en vez de
 importarlo directamente.
+
+Rendimiento del filtro de movimiento: compute_motion_timeseries recorre
+data/raw/<video_id>.mp4 UNA sola vez de principio a fin (sin seeks) y
+guarda la magnitud de flujo óptico muestreada cada
+_MOTION_SAMPLE_INTERVAL_SECONDS en una serie temporal; score_motion_segment
+solo consulta esa serie ya calculada (percentil 90 en el rango del
+candidato) en vez de reabrir/buscar en el vídeo por cada candidato. La
+primera versión llamaba a cv2.VideoCapture.set(CAP_PROP_POS_FRAMES, ...)
+una vez por candidato, y con un GOP largo (keyint por defecto de x264,
+~250 frames) cada seek forzaba redecodificar desde el keyframe anterior:
+con 137 candidatos eso se tradujo en ~58 minutos sobre un vídeo de 9
+minutos. El recorrido único es O(duración del vídeo) una sola vez.
 """
 from __future__ import annotations
 
@@ -45,10 +57,12 @@ logger = logging.getLogger(__name__)
 _SILENCE_FRAME_LENGTH = 2048
 _SILENCE_HOP_LENGTH = 512
 
-# score_motion_segment: nº máximo de pares de frames muestreados por tramo.
-# Evita analizar frame a frame silencios de varios minutos (coste O(frames)
-# de optical flow denso sería inaceptable en una grabación de 1-2h).
-_MOTION_MAX_SAMPLES = 60
+# compute_motion_timeseries: cada cuántos segundos se muestrea un par de
+# frames consecutivos para calcular optical flow a lo largo de todo el
+# vídeo. No hace falta analizar frame a frame (a 30fps serían ~200k pares
+# en una grabación de 2h); un muestreo cada ~0.2-0.5s ya captura si hay
+# acción sostenida en un tramo.
+_MOTION_SAMPLE_INTERVAL_SECONDS = 0.3
 
 # Magnitud de flujo óptico (px/frame, percentil 90 entre frames muestreados)
 # a partir de la cual se considera "movimiento máximo" (score -> 1.0). Es una
@@ -126,82 +140,130 @@ def detect_silence_segments(video_id: str, config: dict) -> list[dict]:
     return segments
 
 
-def score_motion_segment(video_id: str, start: float, end: float, config: dict) -> float:
+def compute_motion_timeseries(video_id: str, config: dict) -> tuple[np.ndarray, np.ndarray]:
     """
-    Calcula la intensidad de movimiento visual en el tramo [start, end) de
-    data/raw/<video_id>.mp4 mediante optical flow denso (Farneback) entre
-    frames muestreados del tramo, devolviendo un score normalizado
-    0.0 (quietud total) - 1.0 (movimiento máximo), mismo rango que
-    config['detect_cuts']['motion_threshold'].
+    Recorre data/raw/<video_id>.mp4 UNA sola vez, de principio a fin y sin
+    seeks, calculando la magnitud (sin normalizar) de optical flow denso
+    (Farneback) entre pares de frames consecutivos muestreados cada
+    _MOTION_SAMPLE_INTERVAL_SECONDS. Los frames que no forman parte de un
+    par muestreado se saltan con cap.grab() (sin decodificar/copiar su
+    imagen), así que el coste total es un único paso secuencial sobre el
+    vídeo en vez de un seek por candidato.
 
-    Se usa el percentil 90 (no la media) de las magnitudes de flujo
-    muestreadas: detect_silence_segments agrupa en un único tramo cualquier
-    silencio de audio continuo, que puede abarcar tanto quietud real como
-    un momento de acción en pantalla (p.ej. 5s de silencio donde el usuario
-    está quieto los 3 primeros segundos y luego mueve el ratón). Promediar
-    diluiría esa acción por debajo del umbral y el tramo completo se
-    cortaría igual, violando la regla de CLAUDE.md ("silencio con
-    movimiento alto... se conserva siempre"). Con el percentil 90 basta con
-    que una parte apreciable del tramo tenga movimiento real para conservar
-    el tramo completo (comportamiento seguro por defecto), sin que un único
-    frame con un pico espurio (glitch de decodificación, frame duplicado)
-    dispare un falso "hay movimiento" como pasaría con el máximo estricto.
-
-    Si el tramo no se puede leer (vídeo no abre, tramo fuera de rango...),
-    se devuelve 1.0 (movimiento máximo) por seguridad: ante la duda, no se
-    corta un tramo que no se ha podido analizar.
+    Returns:
+        (times, magnitudes): dos np.ndarray 1D del mismo tamaño (vacíos si
+        el vídeo no se pudo abrir o leer). times[i] es el instante en
+        segundos del primer frame del par i; magnitudes[i] es la magnitud
+        media (spatial mean, sin normalizar) del flujo óptico entre ese
+        frame y el siguiente.
     """
-    if end <= start:
-        return 0.0
-
     input_path = _raw_video_path(video_id, config)
 
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
-        logger.warning("No se pudo abrir %s para optical flow; se asume movimiento máximo.", input_path)
-        return 1.0
+        logger.warning("No se pudo abrir %s para optical flow; serie de movimiento vacía.", input_path)
+        return np.array([]), np.array([])
+
+    times: list[float] = []
+    magnitudes: list[float] = []
 
     try:
         fps = cap.get(cv2.CAP_PROP_FPS)
         if not fps or fps <= 0:
             fps = 30.0
+        interval_frames = max(1, round(_MOTION_SAMPLE_INTERVAL_SECONDS * fps))
 
-        start_frame = max(0, int(round(start * fps)))
-        end_frame = max(start_frame + 1, int(round(end * fps)))
-        span_frames = end_frame - start_frame
+        logger.info(
+            "Calculando serie de movimiento visual (optical flow, muestreo cada %.2fs)...",
+            _MOTION_SAMPLE_INTERVAL_SECONDS,
+        )
 
-        # Muestrea como mucho _MOTION_MAX_SAMPLES pares de frames
-        # consecutivos, repartidos uniformemente a lo largo del tramo.
-        num_samples = min(_MOTION_MAX_SAMPLES, span_frames)
-        sample_starts = np.linspace(start_frame, end_frame - 1, num=num_samples, dtype=int)
-        sample_starts = sorted(set(int(s) for s in sample_starts))
+        frame_idx = 0
+        next_sample_frame = 0
+        while True:
+            if frame_idx >= next_sample_frame:
+                ok_a, frame_a = cap.read()
+                if not ok_a:
+                    break
+                idx_a = frame_idx
+                frame_idx += 1
 
-        magnitudes: list[float] = []
-        for frame_idx in sample_starts:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ok_a, frame_a = cap.read()
-            ok_b, frame_b = cap.read()
-            if not ok_a or not ok_b:
-                continue
-            gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY)
-            gray_b = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY)
-            flow = cv2.calcOpticalFlowFarneback(
-                gray_a, gray_b, None, 0.5, 3, 15, 3, 5, 1.2, 0
-            )
-            magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-            magnitudes.append(float(np.mean(magnitude)))
+                ok_b, frame_b = cap.read()
+                if not ok_b:
+                    break
+                frame_idx += 1
 
-        if not magnitudes:
-            logger.warning(
-                "No se pudo leer ningún par de frames en [%.2fs, %.2fs) de %s; se asume movimiento máximo.",
-                start, end, input_path,
-            )
-            return 1.0
+                gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY)
+                gray_b = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY)
+                flow = cv2.calcOpticalFlowFarneback(
+                    gray_a, gray_b, None, 0.5, 3, 15, 3, 5, 1.2, 0
+                )
+                magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
 
-        peak_magnitude = float(np.percentile(magnitudes, 90))
+                times.append(idx_a / fps)
+                magnitudes.append(float(np.mean(magnitude)))
+
+                next_sample_frame = idx_a + interval_frames
+            else:
+                if not cap.grab():
+                    break
+                frame_idx += 1
     finally:
         cap.release()
 
+    logger.info("Serie de movimiento visual calculada: %d muestra(s)", len(times))
+    return np.array(times), np.array(magnitudes)
+
+
+def score_motion_segment(
+    motion_times: np.ndarray, motion_magnitudes: np.ndarray, start: float, end: float, config: dict
+) -> float:
+    """
+    Consulta la serie temporal ya calculada por compute_motion_timeseries y
+    devuelve, normalizado 0.0 (quietud total) - 1.0 (movimiento máximo), el
+    percentil 90 de las magnitudes de flujo muestreadas dentro de
+    [start, end).
+
+    Se usa el percentil 90 (no la media) de las magnitudes: detect_silence_segments
+    agrupa en un único tramo cualquier silencio de audio continuo, que puede
+    abarcar tanto quietud real como un momento de acción en pantalla (p.ej.
+    5s de silencio donde el usuario está quieto los 3 primeros segundos y
+    luego mueve el ratón). Promediar diluiría esa acción por debajo del
+    umbral y el tramo completo se cortaría igual, violando la regla de
+    CLAUDE.md ("silencio con movimiento alto... se conserva siempre"). Con
+    el percentil 90 basta con que una parte apreciable del tramo tenga
+    movimiento real para conservar el tramo completo (comportamiento seguro
+    por defecto), sin que una única muestra con un pico espurio (glitch de
+    decodificación, frame duplicado) dispare un falso "hay movimiento" como
+    pasaría con el máximo estricto.
+
+    Si el candidato es más corto que _MOTION_SAMPLE_INTERVAL_SECONDS y no
+    contiene ninguna muestra, se amplía la búsqueda con un margen de
+    tolerancia de _MOTION_SAMPLE_INTERVAL_SECONDS a cada lado.
+
+    Si la serie está vacía (vídeo no se pudo analizar) o no hay ninguna
+    muestra ni siquiera con el margen de tolerancia, se devuelve 1.0
+    (movimiento máximo) por seguridad: ante la duda, no se corta un tramo
+    que no se ha podido evaluar.
+    """
+    if end <= start:
+        return 0.0
+    if len(motion_times) == 0:
+        return 1.0
+
+    mask = (motion_times >= start) & (motion_times < end)
+    if not mask.any():
+        tol = _MOTION_SAMPLE_INTERVAL_SECONDS
+        mask = (motion_times >= start - tol) & (motion_times < end + tol)
+
+    if not mask.any():
+        logger.warning(
+            "No hay muestras de movimiento cerca de [%.2fs, %.2fs); se asume movimiento máximo.",
+            start, end,
+        )
+        return 1.0
+
+    peak_magnitude = float(np.percentile(motion_magnitudes[mask], 90))
     return float(min(1.0, peak_magnitude / _MOTION_NORM_MAGNITUDE_PX))
 
 
@@ -315,6 +377,11 @@ def run(video_id: str, config: dict) -> dict:
     ]
     candidates.sort(key=lambda c: c["start"])
 
+    if candidates:
+        motion_times, motion_magnitudes = compute_motion_timeseries(video_id, config)
+    else:
+        motion_times, motion_magnitudes = np.array([]), np.array([])
+
     logger.info(
         "Aplicando filtro de movimiento visual (motion_threshold=%.2f) a %d candidato(s)...",
         motion_threshold, len(candidates),
@@ -322,7 +389,7 @@ def run(video_id: str, config: dict) -> dict:
     accepted: list[dict] = []
     rejected_by_motion = 0
     for c in candidates:
-        motion_score = score_motion_segment(video_id, c["start"], c["end"], config)
+        motion_score = score_motion_segment(motion_times, motion_magnitudes, c["start"], c["end"], config)
         if motion_score < motion_threshold:
             accepted.append(c)
         else:
