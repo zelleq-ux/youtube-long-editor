@@ -68,13 +68,17 @@ de `data/transcripts/<video_id>.json` agrupando palabras consecutivas cuyo
 hueco es menor que `edit.long_speech_gap_seconds` (por defecto 1.2s). El
 zoom sube lento y suave (curva coseno, sin saltos) desde 1.0 hasta
 `edit.long_speech_zoom_factor` (por defecto ~1.12-1.15) durante los
-primeros `edit.zoom_in_duration_seconds` (por defecto 2.5s) del tramo,
+primeros `edit.zoom_in_duration_seconds` (por defecto 4.5s) del tramo,
 dirigido hacia `edit.facecam_region` (posición aproximada x/y/w/h de la
 webcam sobre el frame original — no hace falta encuadrar la cara con
-precisión, solo que el zoom se sienta dirigido hacia ahí). SE QUEDA en ese
-zoom el resto del tramo (no vuelve a bajar gradualmente); al terminar el
-tramo CORTA SECO a 1.0 (salto instantáneo, no una transición). Los
-timestamps de la transcripción son del vídeo original, así que se
+precisión, solo que el zoom se sienta dirigido hacia ahí). CORTA SECO a
+1.0 (salto instantáneo, no una transición) exactamente en el instante en
+que se completa la rampa (inicio_del_tramo + zoom_in_duration_seconds) —
+NO se mantiene sostenido el resto del tramo de habla, ni el corte espera a
+que el tramo termine. Si el tramo de habla dura menos que
+`zoom_in_duration_seconds` no da tiempo a completar la rampa, así que no
+se aplica zoom en absoluto en ese tramo. Los timestamps de la
+transcripción son del vídeo original, así que se
 remapean a la línea de tiempo ya cortada restando la duración acumulada de
 los cortes anteriores a cada punto — el mismo remapeo que hace falta para
 los capítulos, ver más abajo.

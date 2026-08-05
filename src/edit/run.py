@@ -12,12 +12,15 @@ data/raw/<video_id>.mp4:
    hueco es menor que config['edit']['long_speech_gap_seconds']), aplica el
    zoom típico de streamer: sube lento y suave (curva coseno, sin saltos)
    desde 1.0 hasta config['edit']['long_speech_zoom_factor'] durante los
-   primeros config['edit']['zoom_in_duration_seconds'] del tramo, dirigido
-   hacia config['edit']['facecam_region'] (posición aproximada de la
-   webcam sobre el frame original); se QUEDA en ese zoom el resto del
-   tramo (no vuelve a bajar gradualmente); y al terminar el tramo CORTA
-   SECO a 1.0 (salto instantáneo, sin transición de salida). NO hay zoom
-   en los puntos de corte en sí.
+   primeros config['edit']['zoom_in_duration_seconds'] del tramo (por
+   defecto 4.5s), dirigido hacia config['edit']['facecam_region']
+   (posición aproximada de la webcam sobre el frame original); y CORTA
+   SECO a 1.0 (salto instantáneo, sin transición de salida) exactamente en
+   el instante en que se completa esa rampa — no se mantiene sostenido el
+   resto del tramo de habla, ni el corte espera a que el tramo termine. Si
+   el tramo de habla dura menos que zoom_in_duration_seconds no da tiempo
+   a completar la rampa, así que no se aplica zoom en absoluto en ese
+   tramo. NO hay zoom en los puntos de corte en sí.
 3. Normaliza el audio con ffmpeg loudnorm si config['edit']['loudnorm'].
 4. Si config['edit']['append_outro'], concatena assets/outro/outro.mp4 al
    final.
@@ -272,29 +275,35 @@ def _build_facecam_zoom_expr(speech_segments: list[dict], zoom_factor: float, ra
     """
     Expresión ffmpeg (evaluable con la variable `t`, en la línea de tiempo
     del clip ya cortado) para el efecto de zoom típico de streamer: durante
-    los primeros ramp_seconds de cada tramo de speech_segments sube
-    suavemente desde 1.0 hasta zoom_factor (curva coseno alzada, sin
-    saltos), se queda en zoom_factor el resto del tramo (NO vuelve a bajar
-    gradualmente), y al terminar el tramo cae a 1.0 de golpe — un corte
-    seco, no una transición — porque `between(t,start,end)` deja de
-    cumplirse instantáneamente en t=end. Vale 1.0 fuera de cualquier tramo.
-    None si no hay tramos o el factor es <= 1.0 (nada que animar).
+    la ventana [start, start+ramp_seconds] de cada tramo de speech_segments
+    sube suavemente desde 1.0 hasta zoom_factor (curva coseno alzada, sin
+    saltos), y CORTA SECO a 1.0 exactamente en t=start+ramp_seconds — no en
+    el final del tramo de habla — porque `between(t,start,start+ramp)` deja
+    de cumplirse instantáneamente ahí. El zoom NO se mantiene sostenido
+    durante el resto del tramo de habla; su duración visible es siempre
+    ramp_seconds. Vale 1.0 fuera de esa ventana.
+
+    Si un tramo dura MENOS que ramp_seconds no da tiempo a completar la
+    rampa antes de que el tramo termine, así que se descarta por completo
+    (sin zoom en ese tramo) en vez de comprimir la rampa para que quepa —
+    un zoom a medio completar que además no llega a mostrarse sostenido
+    ni un instante sería más distracción que efecto.
+
+    None si no hay tramos, el factor es <= 1.0, o ramp_seconds <= 0 (con
+    corte en start+ramp_seconds, una rampa de 0s no llegaría a ser visible).
     """
-    if not speech_segments or zoom_factor <= 1.0:
+    if not speech_segments or zoom_factor <= 1.0 or ramp_seconds <= 0:
         return None
 
     terms = []
     for seg in speech_segments:
         start, end = seg["start"], seg["end"]
         dur = end - start
-        if dur <= 0:
+        if dur < ramp_seconds:
             continue
-        ramp = min(ramp_seconds, dur) if ramp_seconds > 0 else 0.0
-        if ramp > 0:
-            level = f"if(lt(t,{start + ramp:.6f}),0.5*(1-cos(PI*(t-{start:.6f})/{ramp:.6f})),1)"
-        else:
-            level = "1"  # sin rampa: salto directo al zoom máximo al empezar el tramo
-        terms.append(f"if(between(t,{start:.6f},{end:.6f}),{level},0)")
+        ramp_end = start + ramp_seconds
+        level = f"0.5*(1-cos(PI*(t-{start:.6f})/{ramp_seconds:.6f}))"
+        terms.append(f"if(between(t,{start:.6f},{ramp_end:.6f}),{level},0)")
     if not terms:
         return None
 
@@ -335,10 +344,12 @@ def apply_cuts_with_zoom(video_id: str, cuts: list[dict], config: dict) -> str:
     (conservando el resto) y aplica el zoom típico de streamer durante los
     tramos de habla continua de config['edit']['long_speech_min_seconds']
     segundos o más (ver detect_long_speech_segments): sube lento hacia
-    config['edit']['facecam_region'], se queda ahí el resto del tramo, y
-    corta seco a 1.0 al terminar (ver _build_facecam_zoom_expr). Todo en
-    una única pasada de ffmpeg (un solo filter_complex: trim de cada tramo
-    a conservar + concat + zoom).
+    config['edit']['facecam_region'] durante los primeros
+    config['edit']['zoom_in_duration_seconds'] del tramo, y corta seco a
+    1.0 exactamente al completarse esa rampa — no al terminar el tramo de
+    habla (ver _build_facecam_zoom_expr). Todo en una única pasada de
+    ffmpeg (un solo filter_complex: trim de cada tramo a conservar + concat
+    + zoom).
 
     Returns:
         Ruta al vídeo con los cortes y el zoom ya aplicados
@@ -346,7 +357,7 @@ def apply_cuts_with_zoom(video_id: str, cuts: list[dict], config: dict) -> str:
     """
     edit_config = config.get("edit", {})
     zoom_factor = float(edit_config.get("long_speech_zoom_factor", 1.0))
-    ramp_seconds = float(edit_config.get("zoom_in_duration_seconds", 2.5))
+    ramp_seconds = float(edit_config.get("zoom_in_duration_seconds", 4.5))
 
     input_path = _raw_video_path(video_id, config)
     info = _video_info(input_path)
