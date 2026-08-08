@@ -50,7 +50,7 @@ edit:
                                     # aplicarle el zoom hacia la webcam
   long_speech_gap_seconds: 1.2     # hueco máximo entre el fin de una palabra y el inicio de la siguiente para
                                     # seguir considerándolas parte del mismo tramo de habla continua
-  long_speech_zoom_factor: 1.13    # escala máxima que alcanza el zoom al completar la rampa; 1.0 = sin zoom
+  long_speech_zoom_factor: 1.0    # escala máxima que alcanza el zoom al completar la rampa; 1.0 = sin zoom
   zoom_in_duration_seconds: 4.5    # duración de la rampa de entrada del zoom (subida lenta); al completarse
                                     # la rampa se vuelve a 1.0 de golpe, sin rampa de salida (no espera al
                                     # final del tramo de habla). Tramos de habla más cortos que esto se quedan
