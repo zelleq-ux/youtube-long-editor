@@ -13,8 +13,9 @@ data/raw/<video_id>.mp4:
    zoom típico de streamer: sube lento y suave (curva coseno, sin saltos)
    desde 1.0 hasta config['edit']['long_speech_zoom_factor'] durante los
    primeros config['edit']['zoom_in_duration_seconds'] del tramo (por
-   defecto 4.5s), dirigido hacia config['edit']['facecam_region']
-   (posición aproximada de la webcam sobre el frame original); y CORTA
+   defecto 4.5s), dirigido hacia config['facecam_region'] (posición
+   aproximada de la webcam sobre el frame original, compartida con
+   detect_cuts); y CORTA
    SECO a 1.0 (salto instantáneo, sin transición de salida) exactamente en
    el instante en que se completa esa rampa — no se mantiene sostenido el
    resto del tramo de habla, ni el corte espera a que el tramo termine. Si
@@ -38,16 +39,112 @@ aplica sobre el vídeo YA CORTADO, cada timestamp se remapea restando la
 duración acumulada de los cortes anteriores — el mismo remapeo que
 CLAUDE.md documenta como necesario para detect_chapters.
 
-Rendimiento: apply_cuts_with_zoom procesa el vídeo con UN solo
-filter_complex (trim de cada tramo a conservar + concat + zoom), en UNA
-sola pasada de ffmpeg — nada de re-abrir/buscar en el archivo de entrada
-por cada corte (ver la lección de detect_cuts en status.md: un seek por
-candidato dispara el tiempo de proceso a decenas de minutos). El grafo de
-filtros va como argumento -filter_complex inline (el build de ffmpeg usado
-en desarrollo no soporta -filter_complex_script ni el indirect @archivo);
-con una grabación muy larga y muchos cientos de cortes esto podría
-acercarse al límite de longitud de línea de comandos de Windows (se
-loguea un aviso si el filtro generado supera un tamaño razonable).
+Rendimiento y arquitectura en dos pasos (rediseñado 2026-08-05): con
+grabaciones largas y muchos cientos de cortes, un único filter_complex
+combinando TODOS los trim/atrim de corte + la concat + el zoom (el diseño
+original) genera una cadena de texto que puede superar el límite de
+longitud de línea de comandos de Windows (~32767 caracteres vía
+CreateProcess; WinError 206 "el nombre del archivo o la extensión es
+demasiado largo") — confirmado con un caso real de 1h39m/181 cortes/47
+tramos de zoom (filtro de 44051 caracteres). El build de ffmpeg usado en
+desarrollo tampoco soporta -filter_complex_script ni el indirect @archivo
+para -filter_complex (verificado: ambos devuelven "option not found"), así
+que no hay forma de sacar el grafo de filtros de la línea de comandos —
+hay que MANTENERLO ACOTADO en caracteres.
+
+apply_cuts_with_zoom se divide por eso en dos pasos independientes:
+
+1. _cut_video: recorta CADA tramo a conservar a su propio archivo aislado
+   (_cut_segment: un simple trim de entrada -ss/-to antes de -i, preciso a
+   nivel de frame al recodificar) — SIN ningún filtro `concat` ni
+   `filter_complex` en absoluto para el corte (ver "Fuga de frames de
+   vídeo en el filtro concat de ffmpeg" más abajo para el porqué de
+   evitarlo por completo en vez de solo acotar su fan-in, que es lo que se
+   intentó primero y no bastó). Los archivos resultantes se pegan después
+   con el concat DEMUXER (_glue_video_files, sin inpoint/outpoint, solo
+   `file '...'` + `-c copy`) — rápido y exacto porque no recorta dentro de
+   ningún archivo, y nunca pasa por el filtro `concat`.
+
+   IMPORTANTE — por qué NO se usa el concat demuxer con inpoint/outpoint
+   directamente sobre el vídeo original (el enfoque obvio para "evitar
+   filter_complex del todo" desde el principio): se probó empíricamente y
+   el inpoint del concat demuxer, al no alinear con un keyframe, NO
+   recorta con precisión de frame al re-codificar — salta al keyframe
+   anterior e incluye de más TODOS los frames intermedios (hasta un GOP
+   entero, ~0.8s en la prueba), exactamente lo que CLAUDE.md prohíbe
+   (comerse habla/acción por un corte impreciso). El outpoint sí es exacto
+   (solo hay que dejar de leer paquetes); el problema es específico del
+   inpoint. Por eso cada tramo se corta con -ss/-to ANTES de -i
+   directamente sobre el vídeo ORIGINAL (frame-accurate al recodificar,
+   sin depender del demuxer para el recorte en sí), y el concat demuxer
+   solo se usa para pegar tramos ya completos.
+
+2. _apply_zoom: aplica el zoom hacia la webcam en un filter_complex
+   APARTE, sobre el vídeo YA CORTADO por _cut_video — mucho más corto que
+   el combinado anterior porque solo cubre los tramos de habla larga (p.ej.
+   47), no los cientos de cortes. El audio no pasa por este filtro (el
+   zoom es solo de vídeo) y se copia sin re-codificar. Si aun así hicieran
+   falta más tramos de zoom de los que caben en un único filter_complex,
+   se encadenan varias pasadas (partición por presupuesto de caracteres,
+   ver _plan_zoom_passes), cada una sobre la salida de la anterior.
+
+_cut_video no tiene límite práctico de nº de tramos: cada uno es una
+llamada de ffmpeg independiente, corta y sin filter_complex, así que ni el
+nº de tramos ni sus caracteres pueden acercar la línea de comandos al
+límite de Windows. _apply_zoom sí sigue particionando por presupuesto de
+caracteres (_MAX_FILTER_COMPLEX_CHARS) porque su filter_complex crece con
+el nº de tramos de zoom — a la escala real del proyecto (decenas) esto
+siempre cabe en una única pasada.
+
+Fuga de frames de vídeo en el filtro concat de ffmpeg (encontrada en
+producción, 2026-08-08, investigada en dos rondas):
+
+Primera ronda: una ejecución real contra `dinoblade_1` (diseño con shards
+de corte particionados SOLO por presupuesto de caracteres, sin límite de
+nº de tramos) produjo un `final.mp4` que se congelaba en el reproductor
+sobre el minuto 10:29 y saltaba al minuto ~67, sin audio a partir de ahí.
+`ffprobe` reveló un salto de PTS de ~3400s en mitad del vídeo, aterrizando
+casi exactamente en la duración TOTAL del shard que lo contenía (133
+tramos concatenados de un tirón en un único filter_complex). Reproducido
+con un test sintético de 1h/400 cortes a 60fps
+(tests/scale_test_edit_pipeline.py) pero NO con <=37 tramos de footage
+real de dinoblade_1 (1080p60) ni con 133 tramos sintéticos a 30fps/640x360
+— se interpretó (de forma incompleta, ver la segunda ronda) como sensible
+a fan-in grande + 60fps, y el fix aplicado entonces fue limitar cada shard
+a 40 tramos como máximo (_MAX_CONCAT_SEGMENTS_PER_SHARD, muy por debajo
+del punto de fallo sintético observado).
+
+Segunda ronda: al revalidar ese fix contra `dinoblade_1` completo (ya con
+el límite de 40 tramos/shard), `ffprobe` sobre el `final.mp4` resultante
+SEGUÍA mostrando 2 discontinuidades de PTS de vídeo (saltos de 25.6s y
+519.5s) — el límite de 40 NO bastaba a la resolución real (1920x1080),
+aunque sí bastaba en el test sintético a 640x360. Aislando el shard
+problemático (los mismos 40 tramos y el mismo código de producción, sin
+el resto del pipeline alrededor) se encontró la causa real: el archivo de
+ESE SHARD, por sí solo, tenía 1077.5s de vídeo pero 1587.8s de audio — el
+filtro `concat` de ffmpeg estaba perdiendo ~510s de FRAMES DE VÍDEO
+silenciosamente dentro de su propio filter_complex (la pista de audio,
+con el mismo fan-in, no se veía afectada en absoluto). Es decir: no es
+(solo) "el concat pierde la cuenta del PTS acumulado" como se pensó en la
+primera ronda, sino un fallo del propio filtro `concat` de ffmpeg al
+reunir muchas ramas de vídeo trim+setpts, aparentemente sensible también a
+la resolución (1080p reproduce el fallo con 40 tramos, algo que 640x360 no
+reproducía ni con 133) — por lo que NINGÚN presupuesto de nº de tramos por
+shard es una cota fiable mientras se siga usando el filtro `concat` para
+el corte.
+
+Fix definitivo: eliminar el filtro `concat` del paso de CORTE por
+completo (no acotar su fan-in — evitarlo). _cut_video ya no arma shards
+con filter_complex; corta cada tramo a un archivo aislado con un simple
+trim de entrada (_cut_segment, sin ningún filtro) y los pega con el
+concat DEMUXER (_glue_video_files) — el mismo mecanismo ya usado y
+validado para pegar shards entre sí y para la vía rápida de append_outro,
+que opera a nivel de contenedor (paquetes ya completos) y no pasa por el
+filtro `concat`. Revalidado contra `dinoblade_1` completo tras el
+rediseño: 0 discontinuidades de PTS en todo el archivo (ver status.md
+para el detalle). La ruta del zoom (_apply_zoom) nunca usó `concat` (solo
+scale/crop condicionados por `between()`) y no mostró el problema en
+ningún test, así que no necesitaba ningún cambio.
 """
 from __future__ import annotations
 
@@ -72,6 +169,26 @@ logger = logging.getLogger(__name__)
 _LOUDNORM_TARGET_I = -14.0
 _LOUDNORM_TARGET_TP = -1.5
 _LOUDNORM_TARGET_LRA = 11.0
+
+# Presupuesto de caracteres por filter_complex del paso de ZOOM (ver
+# _plan_zoom_passes -- el corte ya no usa filter_complex en absoluto, ver
+# "Fuga de frames de vídeo en el filtro concat de ffmpeg" en el docstring
+# del módulo): Windows limita la línea de comandos de un proceso a ~32767
+# caracteres (CreateProcess; por debajo de eso, WinError 206 "el nombre
+# del archivo o la extensión es demasiado largo"). El resto de argumentos
+# de la llamada a ffmpeg (rutas, flags de códec) apenas ocupan unos
+# cientos de caracteres, así que dejar ~12000 de margen es de sobra.
+_MAX_FILTER_COMPLEX_CHARS = 20000
+
+# Calidad del vídeo intermedio de corte (_cut_segment): más alta que la
+# del vídeo final (_CUT_CRF < _FINAL_CRF) porque este archivo se vuelve a
+# recodificar en el paso de zoom -- una calidad baja aquí compondría dos
+# generaciones de pérdida en vez de una sola. veryfast porque es un
+# intermedio que se borra enseguida, no hace falta optimizar su tamaño.
+_CUT_SHARD_CRF = "16"
+_CUT_SHARD_PRESET = "veryfast"
+_FINAL_CRF = "20"
+_FINAL_PRESET = "medium"
 
 
 def _raw_video_path(video_id: str, config: dict) -> Path:
@@ -338,27 +455,265 @@ def _build_facecam_zoom_filters(
     return scale_filter, crop_filter
 
 
+def _partition_by_length(
+    items: list, build_filter_fn, max_chars: int, max_items: int | None = None
+) -> list[list]:
+    """
+    Agrupa `items` en particiones consecutivas tal que
+    len(build_filter_fn(partition)) no supere max_chars caracteres NI (si
+    se indica max_items) el nº de items por partición supere max_items.
+    Usado por _plan_zoom_passes -- el corte ya no arma ningún
+    filter_complex (ver "Fuga de frames de vídeo en el filtro concat de
+    ffmpeg" en el docstring del módulo), así que esta función solo
+    particiona tramos de ZOOM hoy. Cada item aporta por sí solo un puñado
+    de líneas de longitud acotada (nunca una fracción apreciable de
+    max_chars), así que esto siempre progresa: ninguna partición queda
+    vacía salvo que `items` lo esté.
+    """
+    partitions: list[list] = []
+    current: list = []
+    for item in items:
+        candidate = current + [item]
+        too_long = len(build_filter_fn(candidate)) > max_chars
+        too_many = max_items is not None and len(candidate) > max_items
+        if current and (too_long or too_many):
+            partitions.append(current)
+            current = [item]
+        else:
+            current = candidate
+    if current:
+        partitions.append(current)
+    return partitions
+
+
+def _cut_segment(
+    input_path: Path, start: float, end: float, index: int, total: int, out_dir: Path
+) -> Path:
+    """
+    Recorta UN tramo [start, end] (timestamps absolutos del vídeo de
+    entrada) a su propio archivo aislado, con un simple trim de entrada
+    (-ss/-to antes de -i, preciso a nivel de frame al recodificar) -- SIN
+    ningún filtro `concat` ni `filter_complex`. Cada llamada de ffmpeg
+    produce un único tramo independiente: no hay fan-in de `concat` que
+    pueda perder frames (ver "Fuga de frames de vídeo en el filtro concat
+    de ffmpeg" en el docstring del módulo).
+    """
+    out_path = out_dir / f"_cut_seg_{index}.mp4"
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start:.6f}", "-to", f"{end:.6f}",
+        "-i", str(input_path),
+        "-c:v", "libx264", "-crf", _CUT_SHARD_CRF, "-preset", _CUT_SHARD_PRESET, "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
+        str(out_path),
+    ]
+    _run_ffmpeg(
+        cmd,
+        description=f"Cortando tramo {index + 1}/{total} ({start:.2f}s-{end:.2f}s del vídeo original)",
+    )
+    return out_path
+
+
+def _glue_video_files(paths: list[Path], out_path: Path) -> None:
+    """
+    Pega los archivos de `paths` (ya completos, cada uno un tramo del
+    vídeo final, con los mismos parámetros de stream fijados por
+    _cut_segment) con el concat DEMUXER, SIN inpoint/outpoint (solo
+    `file '...'` por entrada) y `-c copy`: rápido y exacto porque no
+    recorta dentro de ningún archivo a mitad de GOP (ver la nota del
+    docstring del módulo sobre por qué NO se usa inpoint/outpoint para
+    cortar), y no pasa por el filtro `concat` de ffmpeg -- mismo mecanismo
+    ya validado en la vía rápida de append_outro.
+    """
+    list_path = out_path.with_suffix(".txt")
+    list_lines = [f"file '{Path(p).resolve().as_posix()}'" for p in paths]
+    list_path.write_text("\n".join(list_lines) + "\n", encoding="utf-8")
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+        "-c", "copy",
+        str(out_path),
+    ]
+    _run_ffmpeg(cmd, description=f"Uniendo {len(paths)} tramo(s) cortado(s)")
+    list_path.unlink(missing_ok=True)
+
+
+def _cut_video(input_path: Path, keep_segments: list[tuple[float, float]], out_dir: Path) -> Path:
+    """
+    Recorta `keep_segments` de `input_path`: cada tramo a su propio
+    archivo aislado (_cut_segment, sin `concat` ni `filter_complex` -- ver
+    "Fuga de frames de vídeo en el filtro concat de ffmpeg" en el
+    docstring del módulo) y los pega después con el concat DEMUXER
+    (_glue_video_files). Sin límite práctico de nº de tramos: cada uno es
+    una llamada de ffmpeg independiente y corta, así que ni el nº de
+    tramos ni sus caracteres pueden acercar la línea de comandos al
+    límite de Windows.
+
+    Returns:
+        Ruta al vídeo ya cortado, sin zoom (data/output/<video_id>/_cuts.mp4).
+    """
+    logger.info(
+        "Cortando %d tramo(s) a conservar (un archivo aislado por tramo, sin filtro concat)",
+        len(keep_segments),
+    )
+    segment_paths = [
+        _cut_segment(input_path, start, end, i, len(keep_segments), out_dir)
+        for i, (start, end) in enumerate(keep_segments)
+    ]
+
+    cut_path = out_dir / "_cuts.mp4"
+    if len(segment_paths) == 1:
+        shutil.move(str(segment_paths[0]), str(cut_path))
+    else:
+        _glue_video_files(segment_paths, cut_path)
+        for p in segment_paths:
+            Path(p).unlink(missing_ok=True)
+    return cut_path
+
+
+def _build_zoom_pass_filter_complex(
+    speech_segments: list[dict], zoom_factor: float, ramp_seconds: float,
+    focus_x: float, focus_y: float, width: int, height: int,
+) -> str | None:
+    """
+    filter_complex que aplica el zoom hacia la webcam de `speech_segments`
+    sobre [0:v] (un único vídeo de entrada -- el ya cortado por
+    _cut_video), dejando el resultado en [vout]. Solo trata vídeo: el
+    audio no pasa por aquí, se copia sin recodificar (ver _apply_zoom).
+    None si _build_facecam_zoom_expr no genera ninguna expresión (ningún
+    tramo de este subconjunto llega a completar la rampa).
+    """
+    zoom_expr = _build_facecam_zoom_expr(speech_segments, zoom_factor, ramp_seconds)
+    if not zoom_expr:
+        return None
+    scale_filter, crop_filter = _build_facecam_zoom_filters(zoom_expr, focus_x, focus_y, width, height)
+    return f"[0:v]{scale_filter}[vscaled];[vscaled]{crop_filter}[vout];"
+
+
+def _plan_zoom_passes(
+    speech_segments: list[dict], zoom_factor: float, ramp_seconds: float,
+    focus_x: float, focus_y: float, width: int, height: int,
+    max_chars: int = _MAX_FILTER_COMPLEX_CHARS,
+) -> list[list[dict]]:
+    """
+    Reparte los tramos de speech_segments que SÍ producen zoom (duración
+    >= ramp_seconds, ver _build_facecam_zoom_expr) en pasadas para
+    _apply_zoom, tal que ninguna pasada supere max_chars (ver
+    _partition_by_length). A la escala real (decenas de tramos) esto cabe
+    siempre en una única pasada; la partición solo entraría en juego si
+    algún día hubiera cientos de tramos de habla larga en un mismo vídeo.
+    """
+    if zoom_factor <= 1.0 or ramp_seconds <= 0:
+        return []
+    usable = [s for s in speech_segments if (s["end"] - s["start"]) >= ramp_seconds]
+    if not usable:
+        return []
+
+    def build(segs: list[dict]) -> str:
+        return (
+            _build_zoom_pass_filter_complex(segs, zoom_factor, ramp_seconds, focus_x, focus_y, width, height)
+            or ""
+        )
+
+    return _partition_by_length(usable, build, max_chars)
+
+
+def _apply_zoom(cut_path: Path, speech_segments: list[dict], config: dict, width: int, height: int) -> Path:
+    """
+    Aplica el zoom hacia la webcam sobre `cut_path` (el vídeo ya cortado,
+    sin zoom) en uno o más filter_complex APARTE del corte -- mucho más
+    corto que el combinado anterior porque solo cubre los tramos de habla
+    larga (p.ej. 47), no los cientos de cortes. Si hicieran falta más
+    pasadas de las que caben en un único filter_complex (ver
+    _plan_zoom_passes), se encadenan: cada pasada parte de la salida de la
+    anterior y solo aplica zoom en su subconjunto de tramos (fuera de ellos
+    el vídeo pasa sin cambios, ver _build_facecam_zoom_filters). Toma
+    posesión de `cut_path`: lo consume (lo renombra o lo borra) en
+    cualquier caso, el llamador no necesita limpiarlo aparte.
+
+    Returns:
+        Ruta a data/output/<video_id>/_cuts_zoom.mp4 (o `cut_path`
+        renombrado sin cambios si no hay ningún tramo de zoom que aplicar).
+    """
+    edit_config = config.get("edit", {})
+    zoom_factor = float(edit_config.get("long_speech_zoom_factor", 1.0))
+    ramp_seconds = float(edit_config.get("zoom_in_duration_seconds", 4.5))
+    facecam = config.get("facecam_region") or {}
+    focus_x = float(facecam.get("x", 0)) + float(facecam.get("w", width)) / 2
+    focus_y = float(facecam.get("y", 0)) + float(facecam.get("h", height)) / 2
+
+    result_path = cut_path.with_name("_cuts_zoom.mp4")
+    passes = _plan_zoom_passes(speech_segments, zoom_factor, ramp_seconds, focus_x, focus_y, width, height)
+    if not passes:
+        # Sin zoom que aplicar: remux barato (sin recodificar) en vez de un
+        # simple rename, para que este archivo tenga +faststart igual que
+        # si hubiera pasado por una pasada de zoom (ver más abajo) --
+        # normalize_audio/append_outro solo lo aplican si de verdad
+        # recodifican, y si loudnorm/outro estuvieran desactivados este
+        # sería directamente el final.mp4 entregado.
+        _run_ffmpeg(
+            ["ffmpeg", "-y", "-i", str(cut_path), "-c", "copy", "-movflags", "+faststart", str(result_path)],
+            description="Sin tramos de zoom que aplicar; remuxeando el vídeo ya cortado",
+        )
+        cut_path.unlink(missing_ok=True)
+        return result_path
+
+    logger.info(
+        "Aplicando zoom hacia la webcam en %d tramo(s) de habla larga en %d pasada(s) de ffmpeg "
+        "(factor=%s, rampa=%ss)",
+        sum(len(p) for p in passes), len(passes), zoom_factor, ramp_seconds,
+    )
+
+    current_input = cut_path
+    for i, segs in enumerate(passes):
+        is_last = i == len(passes) - 1
+        out_path = result_path if is_last else cut_path.with_name(f"_zoom_pass_{i}.mp4")
+        filter_complex = _build_zoom_pass_filter_complex(
+            segs, zoom_factor, ramp_seconds, focus_x, focus_y, width, height
+        )
+        cmd = [
+            "ffmpeg", "-y", "-i", str(current_input),
+            "-filter_complex", filter_complex,
+            "-map", "[vout]", "-map", "0:a",
+            "-c:v", "libx264", "-crf", _FINAL_CRF, "-preset", _FINAL_PRESET, "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+        ]
+        if is_last:
+            # Solo la ÚLTIMA pasada puede acabar siendo el resultado final
+            # de apply_cuts_with_zoom (las intermedias se recodifican otra
+            # vez enseguida), así que solo ella necesita +faststart.
+            cmd += ["-movflags", "+faststart"]
+        cmd.append(str(out_path))
+        _run_ffmpeg(
+            cmd,
+            description=f"Zoom hacia la webcam (pasada {i + 1}/{len(passes)}, {len(segs)} tramo(s))",
+        )
+        Path(current_input).unlink(missing_ok=True)
+        current_input = out_path
+
+    return result_path
+
+
 def apply_cuts_with_zoom(video_id: str, cuts: list[dict], config: dict) -> str:
     """
     Corta los tramos marcados en `cuts` de data/raw/<video_id>.mp4
     (conservando el resto) y aplica el zoom típico de streamer durante los
     tramos de habla continua de config['edit']['long_speech_min_seconds']
     segundos o más (ver detect_long_speech_segments): sube lento hacia
-    config['edit']['facecam_region'] durante los primeros
+    config['facecam_region'] durante los primeros
     config['edit']['zoom_in_duration_seconds'] del tramo, y corta seco a
     1.0 exactamente al completarse esa rampa — no al terminar el tramo de
-    habla (ver _build_facecam_zoom_expr). Todo en una única pasada de
-    ffmpeg (un solo filter_complex: trim de cada tramo a conservar + concat
-    + zoom).
+    habla (ver _build_facecam_zoom_expr).
+
+    En DOS pasos independientes (ver docstring del módulo para el
+    porqué): _cut_video recorta primero (uno o más shards de ffmpeg, según
+    haga falta), y _apply_zoom aplica el zoom después sobre el resultado,
+    en su propio filter_complex -- mucho más pequeño porque solo cubre los
+    tramos de habla larga, no los cortes.
 
     Returns:
         Ruta al vídeo con los cortes y el zoom ya aplicados
         (data/output/<video_id>/_cuts_zoom.mp4).
     """
-    edit_config = config.get("edit", {})
-    zoom_factor = float(edit_config.get("long_speech_zoom_factor", 1.0))
-    ramp_seconds = float(edit_config.get("zoom_in_duration_seconds", 4.5))
-
     input_path = _raw_video_path(video_id, config)
     info = _video_info(input_path)
     duration, width, height = info["duration"], info["width"], info["height"]
@@ -383,72 +738,17 @@ def apply_cuts_with_zoom(video_id: str, cuts: list[dict], config: dict) -> str:
         logger.info(
             "%d tramo(s) de habla continua >= %.1fs detectado(s) (línea de tiempo editada): %s",
             len(speech_segments),
-            float(edit_config.get("long_speech_min_seconds", 10.0)),
+            float(config.get("edit", {}).get("long_speech_min_seconds", 10.0)),
             ", ".join(f"{s['start']:.2f}s-{s['end']:.2f}s" for s in speech_segments),
         )
     else:
         logger.info("No se ha detectado ningún tramo de habla continua; no se aplicará zoom.")
 
-    lines: list[str] = []
-    for i, (start, end) in enumerate(keep_segments):
-        lines.append(f"[0:v]trim=start={start:.6f}:end={end:.6f},setpts=PTS-STARTPTS[v{i}];")
-        lines.append(f"[0:a]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS[a{i}];")
-
-    n = len(keep_segments)
-    if n > 1:
-        concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(n))
-        lines.append(f"{concat_inputs}concat=n={n}:v=1:a=1[vcat][acat];")
-        video_label, audio_label = "vcat", "acat"
-    else:
-        video_label, audio_label = "v0", "a0"
-
-    zoom_expr = _build_facecam_zoom_expr(speech_segments, zoom_factor, ramp_seconds)
-    if zoom_expr:
-        facecam = edit_config.get("facecam_region") or {}
-        focus_x = float(facecam.get("x", 0)) + float(facecam.get("w", width)) / 2
-        focus_y = float(facecam.get("y", 0)) + float(facecam.get("h", height)) / 2
-        scale_filter, crop_filter = _build_facecam_zoom_filters(zoom_expr, focus_x, focus_y, width, height)
-        lines.append(f"[{video_label}]{scale_filter}[vscaled];")
-        lines.append(f"[vscaled]{crop_filter}[vout];")
-    else:
-        lines.append(f"[{video_label}]null[vout];")
-    lines.append(f"[{audio_label}]anull[aout];")
-
-    filter_complex = "".join(lines)
-    if len(filter_complex) > 20000:
-        # El build de ffmpeg usado en desarrollo no soporta -filter_complex_script
-        # (ni el indirect @file para -filter_complex), así que el grafo va
-        # inline en la línea de comandos. Windows soporta hasta ~32767
-        # caracteres de línea de comandos (subprocess.run con lista de
-        # argumentos, sin shell de por medio); con muchos cientos de cortes
-        # en una grabación larga esto podría llegar a ese límite.
-        logger.warning(
-            "El filtro de ffmpeg generado es muy largo (%d caracteres); con muchos "
-            "cientos de cortes esto podría acercarse al límite de línea de comandos de Windows.",
-            len(filter_complex),
-        )
-
     out_dir = _output_dir(video_id, config)
-    output_path = out_dir / "_cuts_zoom.mp4"
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(input_path),
-        "-filter_complex", filter_complex,
-        "-map", "[vout]", "-map", "[aout]",
-        "-c:v", "libx264", "-crf", "20", "-preset", "medium", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
-        "-movflags", "+faststart",
-        str(output_path),
-    ]
-    _run_ffmpeg(
-        cmd,
-        description=(
-            f"Aplicando {len(cuts)} corte(s) y zoom hacia la webcam en {len(speech_segments)} "
-            f"tramo(s) de habla larga (factor={zoom_factor}, rampa={ramp_seconds}s) en una pasada"
-        ),
-    )
+    cut_path = _cut_video(input_path, keep_segments, out_dir)
+    result_path = _apply_zoom(cut_path, speech_segments, config, width, height)
 
-    return str(output_path)
+    return str(result_path)
 
 
 def _measure_loudness(path: str) -> dict | None:

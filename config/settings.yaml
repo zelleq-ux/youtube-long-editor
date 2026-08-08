@@ -6,6 +6,12 @@ paths:
   output: data/output
   outro: assets/outro/outro.mp4
 
+facecam_region:                  # posición aproximada (px, sobre el frame original) de la webcam del
+  x: 15                          # streamer. Compartido entre detect_cuts (recorte de intro por detección
+  y: 400                         # de cara) y edit (zoom hacia la webcam); no hace falta encuadrar la cara
+  w: 365                         # con precisión, solo aproximar la zona. Ajustar si cambia la disposición
+  h: 210                         # de la escena en OBS.
+
 transcribe:
   whisper_model: medium
   device: cpu
@@ -21,6 +27,19 @@ detect_cuts:
   motion_threshold: 0.15         # por debajo de esto = "quietud visual" (0.0-1.0, mismo rango que newclips)
   filler_words: [eh, esto, o sea, bueno bueno]
   cut_margin_seconds: 0.2        # margen de seguridad que se deja sin cortar alrededor del tramo detectado
+  trim_intro: true               # recorta automáticamente la intro (desde 0 hasta que aparece una cara
+                                  # real en facecam_region); no depende de silencio+movimiento, se aplica
+                                  # siempre que se detecte con fiabilidad
+  intro_face_sample_interval_seconds: 1.5   # cada cuántos segundos se muestrea el vídeo buscando cara en facecam_region
+  intro_face_confirm_window_seconds: 8      # ventana (s) sobre la que se exige intro_face_min_detection_ratio de
+                                             # muestras con cara para confirmar que "ya apareció de verdad" (evita
+                                             # falsos negativos puntuales: parpadeo, frame raro)
+  intro_face_min_detection_ratio: 0.7       # proporción mínima de muestras con cara detectada dentro de esa ventana
+  intro_face_max_search_seconds: 1200       # si no se detecta cara fiable en los primeros 20 min, no se recorta nada
+                                             # (evita cortar el vídeo entero por un fallo del detector); subido de 15
+                                             # a 20 min tras validar contra dinoblade_1 real, cuya intro (pantalla de
+                                             # carga + tramo de webcam a pantalla completa antes de la disposición de
+                                             # juego normal) dura ~17-18 min, más que el límite anterior
 
 detect_chapters:
   claude_model: claude-sonnet-5
@@ -36,10 +55,5 @@ edit:
                                     # la rampa se vuelve a 1.0 de golpe, sin rampa de salida (no espera al
                                     # final del tramo de habla). Tramos de habla más cortos que esto se quedan
                                     # sin zoom (no da tiempo a completar la rampa)
-  facecam_region:                  # posición aproximada (px, sobre el frame original) de la webcam del
-    x: 15                          # streamer, hacia la que se dirige el zoom; no hace falta que encuadre la
-    y: 400                         # cara con precisión, solo que el zoom se sienta dirigido hacia esa zona.
-    w: 365                         # Ajustar si cambia la disposición de la escena en OBS.
-    h: 210
   loudnorm: true
   append_outro: true

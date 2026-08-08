@@ -51,6 +51,34 @@ conserva siempre. Ver `config['detect_cuts']['motion_threshold']`.
 Las muletillas detectadas en la transcripción pasan por el mismo filtro de
 contexto visual antes de marcarse para corte.
 
+### Recorte automático de intro (detección de cara)
+
+`detect_cuts` recorta además, de forma INDEPENDIENTE a silencio+movimiento,
+la intro del vídeo: desde el instante 0 hasta que el usuario aparece de
+verdad en pantalla. Se detecta muestreando `data/raw/<video_id>.mp4` cada
+1-2s desde el inicio con un detector de caras ligero de OpenCV sobre el
+recorte de `facecam_region` — no el frame completo (nada de mediapipe ni
+nada pesado). La idea original era un Haar cascade clásico
+(`cv2.CascadeClassifier`), pero la versión de OpenCV instalada (5.0.x)
+eliminó ese binding de Python; en su lugar se usa `cv2.FaceDetectorYN`
+("YuNet", detector basado en DNN igualmente ligero — modelo ONNX de
+~230KB en `assets/models/face_detection_yunet_2023mar.onnx`). Para evitar
+falsos negativos puntuales (parpadeo, frame
+raro) se exige que la cara aparezca en al menos
+`config['detect_cuts']['intro_face_min_detection_ratio']` (por defecto
+70%) de las muestras dentro de una ventana de
+`config['detect_cuts']['intro_face_confirm_window_seconds']` (por defecto
+8s) antes de dar la aparición por buena.
+
+Este corte se aplica SIEMPRE que se detecte con fiabilidad una intro sin
+cara, sin necesidad de que ese tramo también sea silencio — no pasa por el
+filtro de movimiento/silencio de más arriba. Es configurable
+(`config['detect_cuts']['trim_intro']`, por defecto true) para desactivarlo
+en vídeos sin intro sin cara. Si no se detecta ninguna aparición de cara en
+los primeros `config['detect_cuts']['intro_face_max_search_seconds']` (por
+defecto 15 min), no se corta nada por esta vía, para no arriesgarse a
+recortar el vídeo entero por un fallo del detector.
+
 ### Corte automático sin revisión manual
 
 A diferencia del otro proyecto (que tiene cola de revisión), aquí el usuario
@@ -69,8 +97,9 @@ hueco es menor que `edit.long_speech_gap_seconds` (por defecto 1.2s). El
 zoom sube lento y suave (curva coseno, sin saltos) desde 1.0 hasta
 `edit.long_speech_zoom_factor` (por defecto ~1.12-1.15) durante los
 primeros `edit.zoom_in_duration_seconds` (por defecto 4.5s) del tramo,
-dirigido hacia `edit.facecam_region` (posición aproximada x/y/w/h de la
-webcam sobre el frame original — no hace falta encuadrar la cara con
+dirigido hacia `facecam_region` (posición aproximada x/y/w/h de la webcam
+sobre el frame original, en la raíz de la config — compartida con el
+recorte de intro de `detect_cuts` — no hace falta encuadrar la cara con
 precisión, solo que el zoom se sienta dirigido hacia ahí). CORTA SECO a
 1.0 (salto instantáneo, no una transición) exactamente en el instante en
 que se completa la rampa (inicio_del_tramo + zoom_in_duration_seconds) —

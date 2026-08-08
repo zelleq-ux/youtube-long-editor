@@ -15,6 +15,17 @@ Combina TRES señales para decidir qué tramos recortar:
 3. Muletillas en la transcripción (config['detect_cuts']['filler_words']),
    pasadas por el mismo filtro de contexto visual antes de marcarse.
 
+Además, INDEPENDIENTEMENTE de esas tres señales, recorta la intro del
+vídeo (desde el instante 0 hasta que el usuario aparece en pantalla) si
+config['detect_cuts']['trim_intro'] está activo (por defecto sí): ver
+detect_intro_face_cut, que detecta la primera aparición fiable de una cara
+dentro de config['facecam_region'] con un detector de caras ligero de
+OpenCV (cv2.FaceDetectorYN / "YuNet", ver el comentario junto a
+_INTRO_FACE_MODEL_PATH para por qué no es un Haar cascade clásico). Este
+corte NO pasa por el filtro de movimiento/silencio -- se aplica siempre
+que se detecte con fiabilidad una intro sin cara, haya o no haya audio o
+movimiento en ese tramo.
+
 Guarda el resultado en data/cuts/<video_id>/cuts.json y loguea un resumen
 (nº de cortes, duración total eliminada) antes de que edit/ los aplique.
 
@@ -114,6 +125,27 @@ _MOTION_STALL_TIMEOUT_SECONDS = 120.0
 # fijo como fallback (≈500 muestras * 0.3s ≈ 150s de vídeo entre
 # checkpoints).
 _MOTION_CHECKPOINT_FALLBACK_EVERY_SAMPLES = 500
+
+# detect_intro_face_cut: detector de caras ligero para el recorte de
+# facecam_region. La idea original era un Haar cascade clásico
+# (cv2.CascadeClassifier), pero la versión de OpenCV instalada en este
+# proyecto (5.0.x) eliminó ese binding de Python por completo (sin
+# CascadeClassifier ni ninguna constante CASCADE_*, confirmado en este
+# entorno). En su lugar se usa cv2.FaceDetectorYN ("YuNet"), el detector
+# de caras basado en DNN que sí trae esta versión de OpenCV: sigue siendo
+# ligero (modelo ONNX de ~230KB, milisegundos por frame sobre un recorte
+# pequeño) y, como el cascade, solo necesita analizar facecam_region, no
+# el frame completo -- nada de mediapipe ni nada más pesado.
+_INTRO_FACE_MODEL_FILENAME = "face_detection_yunet_2023mar.onnx"
+_INTRO_FACE_MODEL_PATH = REPO_ROOT / "assets" / "models" / _INTRO_FACE_MODEL_FILENAME
+
+# Parámetros de cv2.FaceDetectorYN.create; no son configurables hoy en
+# settings.yaml. Lo que sí lo es es CUÁNTAS muestras/qué ventana de
+# confirmación hacen falta para fiarse del resultado -- ver
+# detect_intro_face_cut.
+_INTRO_FACE_SCORE_THRESHOLD = 0.6
+_INTRO_FACE_NMS_THRESHOLD = 0.3
+_INTRO_FACE_TOP_K = 10  # solo hace falta saber si hay >=1 cara en un recorte pequeño, no las mejores 5000
 
 _WORD_CLEAN_RE = re.compile(r"[^\w]+", re.UNICODE)
 
@@ -629,6 +661,235 @@ def score_motion_segment(
     return float(min(1.0, peak_magnitude / _MOTION_NORM_MAGNITUDE_PX))
 
 
+def _load_face_detector(input_size: tuple[int, int]) -> "cv2.FaceDetectorYN":
+    """
+    Crea el detector de caras YuNet (ver constantes _INTRO_FACE_* más
+    arriba para el porqué de YuNet en vez de un Haar cascade clásico)
+    sobre el modelo ONNX de assets/models/. No se cachea a nivel de
+    módulo: input_size depende de facecam_region, que puede variar de un
+    vídeo a otro, y crear el detector es barato (solo carga el modelo).
+    """
+    if not _INTRO_FACE_MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Falta el modelo de detección de caras ({_INTRO_FACE_MODEL_PATH}). "
+            "Sin él no se puede recortar la intro por detección de cara."
+        )
+    return cv2.FaceDetectorYN.create(
+        str(_INTRO_FACE_MODEL_PATH), "", input_size,
+        score_threshold=_INTRO_FACE_SCORE_THRESHOLD,
+        nms_threshold=_INTRO_FACE_NMS_THRESHOLD,
+        top_k=_INTRO_FACE_TOP_K,
+    )
+
+
+def _facecam_crop_box(region: dict, frame_width: int, frame_height: int) -> tuple[int, int, int, int]:
+    """
+    Convierte facecam_region (x/y/w/h en px sobre el frame original) en
+    una caja de recorte (x0, y0, x1, y1) clampada a los límites reales del
+    frame -- config['facecam_region'] es una posición aproximada fijada a
+    mano, así que puede desbordar ligeramente si el vídeo de entrada
+    resulta tener otra resolución.
+    """
+    frame_width = max(1, frame_width)
+    frame_height = max(1, frame_height)
+    x0 = min(max(0, int(region.get("x", 0))), frame_width - 1)
+    y0 = min(max(0, int(region.get("y", 0))), frame_height - 1)
+    x1 = min(x0 + max(1, int(region.get("w", frame_width))), frame_width)
+    y1 = min(y0 + max(1, int(region.get("h", frame_height))), frame_height)
+    return x0, y0, x1, y1
+
+
+def _frame_has_face(
+    frame: np.ndarray, crop_box: tuple[int, int, int, int], face_detector: "cv2.FaceDetectorYN"
+) -> bool:
+    """
+    True si YuNet detecta al menos una cara dentro de crop_box. Solo
+    analiza ese recorte (no el frame completo): al ser una región pequeña
+    (el tamaño de la webcam), la inferencia es barata incluso muestreando
+    cientos de frames.
+    """
+    x0, y0, x1, y1 = crop_box
+    crop = frame[y0:y1, x0:x1]
+    if crop.size == 0:
+        return False
+    _, faces = face_detector.detect(crop)
+    return faces is not None and len(faces) > 0
+
+
+def _confirm_window_at(
+    samples: list[tuple[float, bool]],
+    end_index: int,
+    confirm_window_seconds: float,
+    min_detection_ratio: float,
+) -> float | None:
+    """
+    Mira hacia atrás desde samples[end_index] (ordenados por tiempo) una
+    ventana de hasta confirm_window_seconds de duración. Si la ventana
+    cubre al menos la mitad de ese tiempo (para no confirmar con una o dos
+    muestras sueltas nada más empezar, antes de que la ventana tenga
+    sentido estadístico) y al menos min_detection_ratio de sus muestras
+    tienen cara detectada, devuelve el timestamp de la PRIMERA muestra CON
+    detección dentro de esa ventana -- el instante en que la cara empezó a
+    aparecer de verdad, no el de la muestra que dispara la confirmación.
+    None si la ventana no cumple los requisitos.
+    """
+    t_end = samples[end_index][0]
+    start_index = end_index
+    while start_index > 0 and t_end - samples[start_index - 1][0] < confirm_window_seconds:
+        start_index -= 1
+    window = samples[start_index:end_index + 1]
+
+    if t_end - window[0][0] < confirm_window_seconds / 2:
+        return None
+
+    ratio = sum(1 for _, detected in window if detected) / len(window)
+    if ratio < min_detection_ratio:
+        return None
+
+    return next(t for t, detected in window if detected)
+
+
+def _confirm_intro_end_time(
+    samples: list[tuple[float, bool]],
+    confirm_window_seconds: float,
+    min_detection_ratio: float,
+) -> float | None:
+    """
+    Primer instante (recorriendo `samples` en orden) en que
+    _confirm_window_at confirma que la cara ya apareció de verdad. Envoltorio
+    de conveniencia sobre una lista completa de muestras ya recogida --
+    usado en tests para verificar la lógica de confirmación de forma
+    aislada, sin tener que simular la lectura de vídeo.
+    """
+    for i in range(len(samples)):
+        confirmed = _confirm_window_at(samples, i, confirm_window_seconds, min_detection_ratio)
+        if confirmed is not None:
+            return confirmed
+    return None
+
+
+def detect_intro_face_cut(video_id: str, config: dict, detector=_frame_has_face) -> dict | None:
+    """
+    Muestrea data/raw/<video_id>.mp4 cada
+    config['detect_cuts']['intro_face_sample_interval_seconds'] desde el
+    inicio (recorrido secuencial con cap.grab() para saltar los frames no
+    muestreados, sin seeks -- misma razón de rendimiento que
+    compute_motion_timeseries: un seek por muestra sería carísimo con un
+    GOP largo), buscando la primera vez que hay una cara real dentro de
+    config['facecam_region'] (detector de caras ligero de OpenCV --
+    cv2.FaceDetectorYN, ver constantes _INTRO_FACE_* -- sobre el recorte
+    pequeño de esa región, no el frame completo).
+
+    Para evitar falsos negativos puntuales (un parpadeo, un frame raro) no
+    basta una única detección: se exige que al menos
+    intro_face_min_detection_ratio de las muestras dentro de una ventana de
+    intro_face_confirm_window_seconds tengan cara detectada antes de
+    considerar que "ya apareció de verdad" (ver _confirm_window_at). El
+    instante devuelto es el de la PRIMERA muestra detectada dentro de esa
+    ventana ya confirmada.
+
+    Si config['detect_cuts']['trim_intro'] es false, o no hay
+    facecam_region configurado, no se busca nada y se devuelve None sin
+    abrir el vídeo. Si no se confirma ninguna aparición de cara dentro de
+    los primeros intro_face_max_search_seconds (por defecto 15 min),
+    TAMPOCO se recorta nada -- evita cortar el vídeo entero por error si
+    el detector falla o el vídeo no tiene cara en facecam_region -- y se
+    loguea un aviso claro.
+
+    `detector` es inyectable (por defecto _frame_has_face, el detector de
+    caras real) para poder testear el resto de la lógica (muestreo
+    secuencial, ventana de confirmación, límite de búsqueda) con un
+    detector simulado, sin depender de que un modelo entrenado en caras
+    reales reconozca marcadores sintéticos dibujados a mano.
+
+    Returns:
+        {"end": float} con el instante (segundos, línea de tiempo del
+        vídeo ORIGINAL) en que se confirma la aparición de la cara, o None
+        si trim_intro está desactivado, falta facecam_region, o no se
+        confirma ninguna aparición dentro del límite de búsqueda.
+    """
+    detect_cuts_config = config.get("detect_cuts", {})
+    if not detect_cuts_config.get("trim_intro", True):
+        logger.info("trim_intro desactivado en config; no se recorta la intro.")
+        return None
+
+    facecam_region = config.get("facecam_region")
+    if not facecam_region:
+        logger.warning(
+            "No hay facecam_region configurado; no se puede recortar la intro por detección de cara."
+        )
+        return None
+
+    sample_interval = float(detect_cuts_config.get("intro_face_sample_interval_seconds", 1.5))
+    confirm_window = float(detect_cuts_config.get("intro_face_confirm_window_seconds", 8.0))
+    min_ratio = float(detect_cuts_config.get("intro_face_min_detection_ratio", 0.7))
+    max_search_seconds = float(detect_cuts_config.get("intro_face_max_search_seconds", 900.0))
+
+    input_path = _raw_video_path(video_id, config)
+    cap = cv2.VideoCapture(str(input_path), cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        cap.release()
+        logger.warning("No se pudo abrir %s para detectar la intro; no se recorta.", input_path)
+        return None
+
+    logger.info(
+        "Buscando primera aparición fiable de cara en facecam_region (muestreo cada %.1fs, "
+        "ventana de confirmación %.1fs >= %.0f%%, máx. %.0fs de búsqueda)...",
+        sample_interval, confirm_window, min_ratio * 100, max_search_seconds,
+    )
+
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0:
+            fps = 30.0
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        crop_box = _facecam_crop_box(facecam_region, frame_width, frame_height)
+        crop_size = (crop_box[2] - crop_box[0], crop_box[3] - crop_box[1])
+        face_detector = _load_face_detector(crop_size)
+
+        interval_frames = max(1, round(sample_interval * fps))
+        max_search_frames = round(max_search_seconds * fps)
+
+        samples: list[tuple[float, bool]] = []
+        frame_idx = 0
+        next_sample_frame = 0
+        confirmed_time: float | None = None
+
+        while frame_idx <= max_search_frames:
+            if frame_idx >= next_sample_frame:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                t = frame_idx / fps
+                detected = detector(frame, crop_box, face_detector)
+                samples.append((t, detected))
+                next_sample_frame = frame_idx + interval_frames
+                frame_idx += 1
+
+                confirmed_time = _confirm_window_at(samples, len(samples) - 1, confirm_window, min_ratio)
+                if confirmed_time is not None:
+                    break
+            else:
+                if not cap.grab():
+                    break
+                frame_idx += 1
+    finally:
+        cap.release()
+
+    if confirmed_time is None:
+        logger.warning(
+            "No se detectó ninguna aparición fiable de cara en facecam_region dentro de los "
+            "primeros %.0fs; no se recorta la intro (para no arriesgarse a cortar el vídeo "
+            "entero por un fallo del detector).",
+            max_search_seconds,
+        )
+        return None
+
+    logger.info("Cara detectada de forma fiable en facecam_region a partir de %.2fs.", confirmed_time)
+    return {"end": confirmed_time}
+
+
 def detect_filler_segments(video_id: str, transcript: dict, config: dict) -> list[dict]:
     """
     Busca config['detect_cuts']['filler_words'] (palabras o frases de varias
@@ -701,8 +962,10 @@ def _merge_overlapping_cuts(cuts: list[dict]) -> list[dict]:
 
 def run(video_id: str, config: dict) -> dict:
     """
-    Combina las tres señales, aplica el filtro de contexto visual, y
-    produce la lista final de cortes.
+    Combina las tres señales de silencio/muletilla+movimiento, aplica el
+    filtro de contexto visual, añade el recorte de intro por detección de
+    cara (independiente, ver detect_intro_face_cut), y produce la lista
+    final de cortes.
 
     Returns:
         dict con {"video_id", "cuts_path", "cuts": [{"start", "end", "type", "reason"}, ...],
@@ -781,6 +1044,27 @@ def run(video_id: str, config: dict) -> dict:
             )
             continue
         margined.append({**c, "start": new_start, "end": new_end})
+
+    # Recorte de intro (independiente de silencio+movimiento: se aplica
+    # siempre que se detecte con fiabilidad una cara en facecam_region,
+    # sin necesidad de que el tramo previo también sea silencio -- ver
+    # detect_intro_face_cut). Solo se margina el borde final (el corte ya
+    # empieza en el instante 0 del vídeo, no hay "antes" que proteger).
+    logger.info("Buscando intro sin cara para recortar...")
+    intro_face_cut = detect_intro_face_cut(video_id, config)
+    if intro_face_cut is not None:
+        intro_end = max(0.0, intro_face_cut["end"] - cut_margin_seconds)
+        if intro_end > 0:
+            margined.append({
+                "start": 0.0,
+                "end": intro_end,
+                "type": "intro",
+                "reason": "intro sin cara detectada en facecam_region",
+            })
+            logger.info(
+                "Recorte de intro: 0.00s-%.2fs (cara detectada de forma fiable a partir de %.2fs)",
+                intro_end, intro_face_cut["end"],
+            )
 
     cuts = _merge_overlapping_cuts(margined)
     total_cut_seconds = sum(c["end"] - c["start"] for c in cuts)
