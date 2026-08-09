@@ -29,6 +29,22 @@ Cubre:
    usuario lo crea a mano) -- run() debe lanzar FileNotFoundError con un
    mensaje claro si no existe, ANTES de construir ninguna petición,
    tanto con execute=False como con execute=True.
+8. _get_channel_name / _verify_channel (2026-08-10, bug real: una subida
+   acabó en un canal equivocado porque el token OAuth se vinculó al canal
+   activo en el navegador, no al que se quería): run() SIEMPRE consulta
+   channels().list(mine=True) antes de construir la petición de subida
+   (tanto execute=False como execute=True) y expone el nombre del canal
+   en el resultado; si config['youtube']['expected_channel_name'] no
+   coincide, lanza RuntimeError ANTES de llamar a videos().insert().
+9. _prepare_thumbnail_upload (2026-08-10, bug real: MediaUploadSizeError
+   a mitad de una subida real por una miniatura de más de 2MB, que además
+   abortó la subida de subtítulos al ser una excepción sin capturar):
+   una imagen ya por debajo del límite se sube tal cual (PNG); una por
+   encima se recomprime a JPEG en memoria (probado con una imagen de
+   ruido aleatoria, deliberadamente incompresible en PNG, para forzar el
+   camino de recompresión de verdad) sin tocar el archivo original en
+   disco; si ni la calidad JPEG mínima basta, lanza RuntimeError con un
+   mensaje claro en vez de dejar que reviente a mitad de la subida.
 
 Uso:
     cd <repo_root>
@@ -45,7 +61,9 @@ import tempfile
 import time
 from pathlib import Path
 
+import cv2
 import httplib2
+import numpy as np
 from googleapiclient.errors import HttpError
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -56,10 +74,15 @@ from src.publish.youtube import (  # noqa: E402
     _description_from_chapters,
     _execute_resumable_upload,
     _final_video_path,
+    _get_channel_name,
+    _prepare_thumbnail_upload,
     _subtitles_path,
     _thumbnail_path,
+    _verify_channel,
+    _YOUTUBE_THUMBNAIL_MAX_BYTES,
     run,
 )
+import src.publish.youtube as publish_youtube  # noqa: E402
 
 failures: list[str] = []
 
@@ -142,11 +165,32 @@ class _FakeCaptionsResource:
         return _FakeCaptionsInsertRequest(kwargs)
 
 
+class _FakeChannelsListRequest:
+    def __init__(self, channel_name: "str | None"):
+        self._channel_name = channel_name
+
+    def execute(self):
+        if self._channel_name is None:
+            return {"items": []}
+        return {"items": [{"snippet": {"title": self._channel_name}}]}
+
+
+class _FakeChannelsResource:
+    def __init__(self, channel_name: "str | None" = "Fake Channel"):
+        self.channel_name = channel_name
+        self.list_calls: list[dict] = []
+
+    def list(self, **kwargs):
+        self.list_calls.append(kwargs)
+        return _FakeChannelsListRequest(self.channel_name)
+
+
 class _FakeYoutubeService:
-    def __init__(self, final_response: dict, chunks_before_done: int = 1):
+    def __init__(self, final_response: dict, chunks_before_done: int = 1, channel_name: "str | None" = "Fake Channel"):
         self.videos_resource = _FakeVideosResource(final_response, chunks_before_done)
         self.thumbnails_resource = _FakeThumbnailsResource()
         self.captions_resource = _FakeCaptionsResource()
+        self.channels_resource = _FakeChannelsResource(channel_name)
 
     def videos(self):
         return self.videos_resource
@@ -156,6 +200,9 @@ class _FakeYoutubeService:
 
     def captions(self):
         return self.captions_resource
+
+    def channels(self):
+        return self.channels_resource
 
 
 def _write_dummy_file(path: Path, content: bytes = b"dummy") -> None:
@@ -382,6 +429,128 @@ def main() -> int:
                 check("un HttpError no transitorio (404) se propaga sin reintentar", exc.resp.status == 404, f"status={exc.resp.status}")
         finally:
             time.sleep = real_sleep
+
+        print("=== _get_channel_name / _verify_channel ===")
+        fake_service_channel = _FakeYoutubeService(final_response={"id": "unused"}, channel_name="Zelleq")
+        check(
+            "_get_channel_name devuelve el título del canal del token actual",
+            _get_channel_name(fake_service_channel) == "Zelleq",
+        )
+
+        fake_service_no_channel = _FakeYoutubeService(final_response={"id": "unused"}, channel_name=None)
+        try:
+            _get_channel_name(fake_service_no_channel)
+            check("_get_channel_name sin ningún canal devuelto lanza RuntimeError", False, "no lanzó excepción")
+        except RuntimeError:
+            check("_get_channel_name sin ningún canal devuelto lanza RuntimeError", True, "")
+
+        check(
+            "_verify_channel sin expected_channel_name configurado: devuelve el canal sin comprobar nada",
+            _verify_channel(fake_service_channel, {}) == "Zelleq",
+        )
+        check(
+            "_verify_channel con expected_channel_name que SÍ coincide: devuelve el canal sin lanzar",
+            _verify_channel(fake_service_channel, {"youtube": {"expected_channel_name": "Zelleq"}}) == "Zelleq",
+        )
+        try:
+            _verify_channel(fake_service_channel, {"youtube": {"expected_channel_name": "Canal de VODs"}})
+            check("_verify_channel con expected_channel_name que NO coincide lanza RuntimeError", False, "no lanzó excepción")
+        except RuntimeError as exc:
+            check(
+                "_verify_channel con expected_channel_name que NO coincide lanza RuntimeError con ambos nombres en el mensaje",
+                "Zelleq" in str(exc) and "Canal de VODs" in str(exc),
+                f"mensaje={exc}",
+            )
+
+        print("=== run(): con canal equivocado, falla ANTES de construir videos().insert() ===")
+        video_id_wrong_channel = "wrong_channel_video"
+        output_dir_wrong_channel = work_dir / video_id_wrong_channel
+        output_dir_wrong_channel.mkdir(parents=True)
+        _write_dummy_file(output_dir_wrong_channel / "final.mp4")
+        _write_dummy_file(output_dir_wrong_channel / "thumbnail.png")
+        config_wrong_channel = {**config, "youtube": {"expected_channel_name": "Canal Principal"}}
+        fake_service_wrong_channel = _FakeYoutubeService(final_response={"id": "should_not_be_used"}, channel_name="Canal de VODs")
+        try:
+            run(video_id_wrong_channel, config_wrong_channel, youtube_service=fake_service_wrong_channel, execute=False)
+            check("run() con canal equivocado lanza RuntimeError", False, "no lanzó excepción")
+        except RuntimeError:
+            check("run() con canal equivocado lanza RuntimeError", True, "")
+        check(
+            "con canal equivocado, NUNCA se construye ninguna petición videos().insert()",
+            len(fake_service_wrong_channel.videos_resource.insert_calls) == 0,
+        )
+
+        print("=== run() con canal correcto: channel_name viaja en el resultado ===")
+        config_right_channel = {**config, "youtube": {"expected_channel_name": "Zelleq"}}
+        result_right_channel = run(video_id, config_right_channel, youtube_service=fake_service_channel, execute=False)
+        check(
+            "run() con canal correcto devuelve channel_name en el resultado y no lanza",
+            result_right_channel.get("channel_name") == "Zelleq",
+            f"result={result_right_channel}",
+        )
+
+        print("=== _prepare_thumbnail_upload: imagen por debajo del límite se sube tal cual (PNG) ===")
+        small_thumb_path = work_dir / "small_thumb.png"
+        small_image = np.zeros((100, 100, 3), dtype=np.uint8)
+        small_image[:, :] = (30, 60, 90)
+        cv2.imwrite(str(small_thumb_path), small_image)
+        small_bytes_before = small_thumb_path.read_bytes()
+        check(
+            "la imagen pequeña de prueba está, en efecto, por debajo del límite",
+            len(small_bytes_before) <= _YOUTUBE_THUMBNAIL_MAX_BYTES,
+            f"size={len(small_bytes_before)}",
+        )
+        result_data, result_mimetype = _prepare_thumbnail_upload(small_thumb_path)
+        check(
+            "por debajo del límite: se devuelven los bytes ORIGINALES tal cual, mimetype image/png",
+            result_data == small_bytes_before and result_mimetype == "image/png",
+        )
+
+        print("=== _prepare_thumbnail_upload: imagen por ENCIMA del límite se recomprime a JPEG y cabe ===")
+        large_thumb_path = work_dir / "large_thumb.png"
+        # ruido aleatorio: deliberadamente incompresible con PNG (sin patrones repetidos),
+        # para garantizar de verdad que supera el límite y ejercitar el camino de recompresión real.
+        rng = np.random.default_rng(20260810)
+        noisy_image = rng.integers(0, 256, size=(1080, 1920, 3), dtype=np.uint8)
+        cv2.imwrite(str(large_thumb_path), noisy_image, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+        large_size_before = large_thumb_path.stat().st_size
+        check(
+            "la imagen de ruido de prueba SÍ supera el límite de 2MB (para ejercitar la recompresión real)",
+            large_size_before > _YOUTUBE_THUMBNAIL_MAX_BYTES,
+            f"size={large_size_before}",
+        )
+        compressed_data, compressed_mimetype = _prepare_thumbnail_upload(large_thumb_path)
+        check(
+            "por encima del límite: el resultado recomprimido cabe bajo el límite y es JPEG",
+            len(compressed_data) <= _YOUTUBE_THUMBNAIL_MAX_BYTES and compressed_mimetype == "image/jpeg",
+            f"size={len(compressed_data)}",
+        )
+        decoded = cv2.imdecode(np.frombuffer(compressed_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        check(
+            "la recompresión NO cambia la resolución de la imagen",
+            decoded is not None and decoded.shape[:2] == (1080, 1920),
+            f"shape={None if decoded is None else decoded.shape}",
+        )
+        check(
+            "el archivo original en disco NUNCA se toca (mismo tamaño después de comprimir para la subida)",
+            large_thumb_path.stat().st_size == large_size_before,
+        )
+
+        print("=== _prepare_thumbnail_upload: si ni la calidad mínima cabe, lanza RuntimeError claro ===")
+        original_max_bytes = publish_youtube._YOUTUBE_THUMBNAIL_MAX_BYTES
+        publish_youtube._YOUTUBE_THUMBNAIL_MAX_BYTES = 100  # imposible de cumplir incluso a la mínima calidad JPEG
+        try:
+            try:
+                _prepare_thumbnail_upload(large_thumb_path)
+                check("límite imposible: _prepare_thumbnail_upload lanza RuntimeError", False, "no lanzó excepción")
+            except RuntimeError as exc:
+                check(
+                    "límite imposible: _prepare_thumbnail_upload lanza RuntimeError con mensaje claro",
+                    "MB" in str(exc) or "calidad" in str(exc),
+                    f"mensaje={exc}",
+                )
+        finally:
+            publish_youtube._YOUTUBE_THUMBNAIL_MAX_BYTES = original_max_bytes
 
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)

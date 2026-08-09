@@ -80,3 +80,12 @@ subtitles:
   reading_cps_max: 20              # límite superior se aplica como suelo de duración, ver src/subtitles/run.py
   natural_pause_gap_seconds: 0.5   # hueco entre palabras a partir del cual se considera una pausa natural donde
                                     # es preferible cortar un subtítulo (además de puntuación de frase/cláusula)
+
+youtube:
+  expected_channel_name: Zelleq    # nombre EXACTO del canal de YouTube al que deben ir las subidas (opcional).
+                                    # Si se rellena, publish/youtube.py aborta con un error claro ANTES de subir
+                                    # si el token OAuth actual (token.json) está vinculado a un canal distinto --
+                                    # el flujo OAuth se vincula al canal que esté activo en el NAVEGADOR al
+                                    # autorizar, no necesariamente al que se quiere, y la API de YouTube no
+                                    # permite elegir canal de destino por parámetro en la subida (bug real,
+                                    # 2026-08-10: una subida acabó en un canal equivocado por esto)
