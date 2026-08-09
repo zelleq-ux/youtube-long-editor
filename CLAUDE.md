@@ -87,6 +87,22 @@ previa, confiando en los umbrales configurados. Aun así, `detect_cuts` debe
 loguear un resumen (nº de cortes, duración total eliminada) antes de que
 `edit/` los aplique, para que quede constancia en el log de ejecución.
 
+### Renderizado parcial sin pérdida en el paso de corte
+
+Por rendimiento (idea tomada de auto-editor de WyattBlue), `edit/` no
+recodifica el vídeo completo al aplicar los cortes: por cada tramo a
+conservar, copia sin recodificar (`-c copy`, prácticamente gratis) el
+interior que cae entre dos keyframes reales del vídeo de entrada, y solo
+recodifica (crf16/veryfast, como siempre) los bordes de ese tramo hasta
+el keyframe más cercano — o el tramo completo, como antes, si es más
+corto que un intervalo de keyframe y no hay hueco interior que copiar.
+El resultado es exactamente el mismo vídeo de siempre (mismos cortes,
+misma precisión a nivel de frame); solo cambia cuánto de ese trabajo se
+recodifica de verdad. Medido contra `dinoblade_1`/`icarus_1` reales:
+~91%/~76% de la duración conservada es candidata a copia directa (ver
+`src/edit/run.py` y `status.md` para el detalle completo, incluida la
+medición de tiempo real).
+
 ### Zoom hacia la webcam en habla larga
 
 En vez de un micro-zoom en cada punto de corte, `edit/` aplica el zoom

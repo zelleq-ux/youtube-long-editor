@@ -145,15 +145,98 @@ rediseño: 0 discontinuidades de PTS en todo el archivo (ver status.md
 para el detalle). La ruta del zoom (_apply_zoom) nunca usó `concat` (solo
 scale/crop condicionados por `between()`) y no mostró el problema en
 ningún test, así que no necesitaba ningún cambio.
+
+Renderizado parcial sin pérdida (smart cut, 2026-08-09, idea tomada de
+auto-editor de WyattBlue — investigado primero con un prototipo aislado
+antes de tocar este módulo, ver status.md para el detalle de esa
+investigación):
+
+Cada tramo a conservar se recodificaba ENTERO a crf16/veryfast en
+_cut_segment, aunque la inmensa mayoría de su duración no toca ningún
+punto de corte — solo sus dos extremos importan para que el corte sea
+preciso a nivel de frame. Midiendo contra los `cuts.json` reales de
+`dinoblade_1` (147 cortes) e `icarus_1` (549 cortes, mucha más densidad
+de cortes) qué fracción de cada tramo a conservar cae entre dos
+keyframes reales del vídeo de entrada: 91.2% y 76.0% respectivamente
+podría copiarse sin recodificar en vez de recodificarse — la fracción no
+copiable se concentra en los tramos más cortos que un intervalo de
+keyframe (frecuentes en `icarus_1`), no en el grueso de la duración.
+
+Mecanismo (`_cut_segment_smart`, sustituye al antiguo `_cut_segment` que
+solo recodificaba el tramo completo): antes de cortar, `_cut_video`
+escanea UNA VEZ los timestamps de todos los keyframes del vídeo de
+entrada (`_scan_keyframe_timestamps`, vía `ffprobe -show_entries
+packet=pts_time,flags` — solo demuxea paquetes, no decodifica, así que es
+barato incluso en grabaciones de 1-2h: ~15-35s medido contra
+`dinoblade_1`/`icarus_1` reales, despreciable frente a los 25-55 min del
+pipeline completo). Por cada tramo [start, end] a conservar:
+
+1. Busca (bisección sobre la lista ordenada de keyframes) el primer
+   keyframe >= start (`kf_start`) y el último keyframe <= end (`kf_end`).
+2. Si `kf_end > kf_start` (hay un hueco interior real entre ambos):
+   recodifica solo la cabeza [start, kf_start) y la cola [kf_end, end)
+   (si no están vacías — con `start`/`end` ya alineados a keyframe no
+   haría falta ninguna de las dos) igual que antes (crf16/veryfast), y
+   copia SIN RECODIFICAR (`-c copy`) el interior [kf_start, kf_end) —
+   válido porque `-ss`/`-to` antes de `-i` con estos timestamps caen
+   EXACTAMENTE en keyframes reales, así que ffmpeg no necesita
+   redondear al keyframe anterior para arrancar la copia (ver más abajo
+   por qué esto SÍ es distinto del problema ya documentado del inpoint
+   del concat demuxer).
+3. Si no hay hueco útil (tramo más corto que un intervalo de keyframe):
+   recodifica el tramo completo, exactamente el comportamiento de
+   siempre — fallback sin pérdida de precisión ni de robustez.
+
+Todos los fragmentos resultantes (1 a 3 por tramo) se pegan con el MISMO
+concat DEMUXER (`_glue_video_files`) ya usado para pegar tramos
+completos — no hace falta ningún mecanismo nuevo de unión.
+
+Por qué esto NO es el mismo problema que el inpoint impreciso del concat
+demuxer (documentado más arriba, el motivo por el que cada tramo se
+corta con `-ss`/`-to` antes de `-i` en vez de con el demuxer): aquel
+problema aparecía porque el inpoint NO coincidía con un keyframe real
+(caía a mitad de GOP) y el demuxer redondeaba hacia atrás incluyendo de
+más. Aquí `kf_start`/`kf_end` SON keyframes reales (leídos directamente
+del vídeo, no arbitrarios), así que no hay nada que redondear — `-ss` cae
+justo donde ya hay un keyframe. Verificado explícitamente con un test
+sintético (ver tests/test_smart_cut_segments.py): el contenido copiado es
+bit-idéntico (hash del frame decodificado) al del vídeo de origen en el
+mismo instante.
+
+Efecto secundario menor aceptado: dividir un tramo en cabeza/interior/
+cola añade puntos de corte extra, y `-ss`/`-to` redondea cada uno a favor
+de conservar un poco más de contenido, nunca menos (mismo tipo de
+redondeo ya aceptado en producción — ver los ~2.9s de sobra en los 182
+tramos de `dinoblade_1` más arriba) — esto escala con el Nº DE TRAMOS QUE
+SE DIVIDEN, no con la duración total, así que es irrelevante en la
+práctica (unas pocas fracciones de segundo repartidas en todo el vídeo).
+
+Color range / pix_fmt: los `raw.mp4` reales de este proyecto son
+`yuvj420p` (rango de color completo, propagado desde la fuente aunque
+`ingest/run.py` solo pide `-pix_fmt yuv420p` sin más). Comprobado
+explícitamente que recodificar cabeza/cola con los mismos flags de
+siempre (sin ningún `-color_range` adicional) conserva ese mismo rango
+completo automáticamente — no hay salto de niveles de negro/blanco en la
+costura entre un fragmento copiado y uno recodificado.
+
+Validado con un test sintético dedicado (tests/test_smart_cut_segments.py,
+mismo patrón que scale_test_edit_pipeline.py: genera su propio vídeo,
+sin tocar data/) que verifica bit-identidad del interior copiado,
+continuidad de PTS/DTS (reutilizando check_pts_continuity/
+check_av_duration_consistency) y consistencia de color_range/pix_fmt; y
+contra un vídeo real (ver status.md para la medición de tiempo real
+antes/después del paso de corte).
 """
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import logging
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from src.common import db
@@ -180,7 +263,7 @@ _LOUDNORM_TARGET_LRA = 11.0
 # cientos de caracteres, así que dejar ~12000 de margen es de sobra.
 _MAX_FILTER_COMPLEX_CHARS = 20000
 
-# Calidad del vídeo intermedio de corte (_cut_segment): más alta que la
+# Calidad del vídeo intermedio de corte (_cut_segment_recode): más alta que la
 # del vídeo final (_CUT_CRF < _FINAL_CRF) porque este archivo se vuelve a
 # recodificar en el paso de zoom -- una calidad baja aquí compondría dos
 # generaciones de pérdida en vez de una sola. veryfast porque es un
@@ -486,19 +569,59 @@ def _partition_by_length(
     return partitions
 
 
-def _cut_segment(
-    input_path: Path, start: float, end: float, index: int, total: int, out_dir: Path
-) -> Path:
+def _scan_keyframe_timestamps(path: Path) -> list[float]:
     """
-    Recorta UN tramo [start, end] (timestamps absolutos del vídeo de
-    entrada) a su propio archivo aislado, con un simple trim de entrada
-    (-ss/-to antes de -i, preciso a nivel de frame al recodificar) -- SIN
-    ningún filtro `concat` ni `filter_complex`. Cada llamada de ffmpeg
-    produce un único tramo independiente: no hay fan-in de `concat` que
-    pueda perder frames (ver "Fuga de frames de vídeo en el filtro concat
-    de ffmpeg" en el docstring del módulo).
+    Lista ORDENADA de los timestamps (segundos, pts_time) de todos los
+    keyframes de la pista de vídeo de `path`, vía ffprobe -- solo demuxea
+    paquetes (lee sus flags), sin decodificar ningún frame, así que es
+    barato incluso en grabaciones de 1-2h (ver "Renderizado parcial sin
+    pérdida" en el docstring del módulo). Usado por _cut_video para
+    decidir qué parte interior de cada tramo a conservar se puede copiar
+    sin recodificar.
     """
-    out_path = out_dir / f"_cut_seg_{index}.mp4"
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0",
+        str(path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe falló escaneando keyframes de {path}:\n{result.stderr[-2000:]}")
+    keyframes: list[float] = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(",")
+        if len(parts) != 2 or "K" not in parts[1]:
+            continue
+        try:
+            keyframes.append(float(parts[0]))
+        except ValueError:
+            continue
+    keyframes.sort()
+    return keyframes
+
+
+def _keyframe_at_or_after(keyframes: list[float], t: float) -> float | None:
+    """Primer keyframe >= t de `keyframes` (ya ordenada), o None si no hay ninguno."""
+    i = bisect.bisect_left(keyframes, t)
+    return keyframes[i] if i < len(keyframes) else None
+
+
+def _keyframe_at_or_before(keyframes: list[float], t: float) -> float | None:
+    """Último keyframe <= t de `keyframes` (ya ordenada), o None si no hay ninguno."""
+    i = bisect.bisect_right(keyframes, t) - 1
+    return keyframes[i] if i >= 0 else None
+
+
+def _cut_segment_recode(input_path: Path, start: float, end: float, out_path: Path, description: str) -> None:
+    """
+    Recodifica [start, end] (timestamps absolutos del vídeo de entrada) a
+    out_path -- crf16/veryfast, con un simple trim de entrada (-ss/-to
+    antes de -i, preciso a nivel de frame) -- SIN ningún filtro `concat`
+    ni `filter_complex` (ver "Fuga de frames de vídeo en el filtro concat
+    de ffmpeg" en el docstring del módulo). Usado tanto para el fallback
+    de tramo completo como para la cabeza/cola del renderizado parcial
+    sin pérdida (ver _cut_segment_smart).
+    """
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{start:.6f}", "-to", f"{end:.6f}",
@@ -507,18 +630,101 @@ def _cut_segment(
         "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
         str(out_path),
     ]
-    _run_ffmpeg(
-        cmd,
-        description=f"Cortando tramo {index + 1}/{total} ({start:.2f}s-{end:.2f}s del vídeo original)",
+    _run_ffmpeg(cmd, description=description)
+
+
+def _cut_segment_copy(input_path: Path, start: float, end: float, out_path: Path, description: str) -> None:
+    """
+    Copia [start, end] SIN recodificar (-c copy, prácticamente gratis).
+    Solo válido cuando `start` y `end` caen EXACTAMENTE en keyframes
+    reales del vídeo de entrada (ver _cut_segment_smart y "Renderizado
+    parcial sin pérdida" en el docstring del módulo) -- si no coincidieran
+    con un keyframe, ffmpeg redondearía `start` hacia el keyframe anterior
+    e incluiría de más contenido intermedio (el mismo problema ya
+    documentado del inpoint del concat demuxer, evitado aquí porque los
+    timestamps SÍ son keyframes reales).
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start:.6f}", "-to", f"{end:.6f}",
+        "-i", str(input_path),
+        "-c", "copy",
+        str(out_path),
+    ]
+    _run_ffmpeg(cmd, description=description)
+
+
+def _cut_segment_smart(
+    input_path: Path, start: float, end: float, keyframes: list[float],
+    index: int, total: int, out_dir: Path,
+) -> list[Path]:
+    """
+    Recorta el tramo [start, end] (timestamps absolutos del vídeo de
+    entrada) a uno o más archivos aislados, aplicando "renderizado
+    parcial sin pérdida" (ver docstring del módulo): busca el primer
+    keyframe >= start (`kf_start`) y el último keyframe <= end
+    (`kf_end`); si hay hueco entre ambos, recodifica solo la cabeza
+    [start, kf_start) y la cola [kf_end, end) (omitidas si ya están
+    vacías) y copia sin recodificar el interior [kf_start, kf_end) --
+    mucho más barato que recodificar el tramo entero. Si el tramo es más
+    corto que un intervalo de keyframe (no hay hueco útil), cae al
+    comportamiento de siempre: recodificar el tramo completo.
+
+    Returns:
+        Lista de 1 a 3 fragmentos, EN ORDEN, listos para pegarse con el
+        concat demuxer junto con los del resto de tramos.
+    """
+    kf_start = _keyframe_at_or_after(keyframes, start)
+    kf_end = _keyframe_at_or_before(keyframes, end)
+    useful_gap = kf_start is not None and kf_end is not None and kf_end > kf_start
+
+    if not useful_gap:
+        out_path = out_dir / f"_cut_seg_{index}_full.mp4"
+        _cut_segment_recode(
+            input_path, start, end, out_path,
+            description=(
+                f"Cortando tramo {index + 1}/{total} completo "
+                f"({start:.2f}s-{end:.2f}s, sin hueco interior copiable)"
+            ),
+        )
+        return [out_path]
+
+    fragments: list[Path] = []
+    if kf_start > start:
+        head_path = out_dir / f"_cut_seg_{index}_head.mp4"
+        _cut_segment_recode(
+            input_path, start, kf_start, head_path,
+            description=f"Cortando tramo {index + 1}/{total}, cabeza ({start:.2f}s-{kf_start:.2f}s)",
+        )
+        fragments.append(head_path)
+
+    mid_path = out_dir / f"_cut_seg_{index}_mid.mp4"
+    _cut_segment_copy(
+        input_path, kf_start, kf_end, mid_path,
+        description=(
+            f"Copiando tramo {index + 1}/{total}, interior sin recodificar "
+            f"({kf_start:.2f}s-{kf_end:.2f}s)"
+        ),
     )
-    return out_path
+    fragments.append(mid_path)
+
+    if end > kf_end:
+        tail_path = out_dir / f"_cut_seg_{index}_tail.mp4"
+        _cut_segment_recode(
+            input_path, kf_end, end, tail_path,
+            description=f"Cortando tramo {index + 1}/{total}, cola ({kf_end:.2f}s-{end:.2f}s)",
+        )
+        fragments.append(tail_path)
+
+    return fragments
 
 
 def _glue_video_files(paths: list[Path], out_path: Path) -> None:
     """
-    Pega los archivos de `paths` (ya completos, cada uno un tramo del
-    vídeo final, con los mismos parámetros de stream fijados por
-    _cut_segment) con el concat DEMUXER, SIN inpoint/outpoint (solo
+    Pega los archivos de `paths` (ya completos, cada uno un fragmento del
+    vídeo final -- recodificado por _cut_segment_recode o copiado sin
+    recodificar por _cut_segment_copy, ambos con los mismos parámetros de
+    stream) con el concat DEMUXER, SIN inpoint/outpoint (solo
     `file '...'` por entrada) y `-c copy`: rápido y exacto porque no
     recorta dentro de ningún archivo a mitad de GOP (ver la nota del
     docstring del módulo sobre por qué NO se usa inpoint/outpoint para
@@ -539,26 +745,49 @@ def _glue_video_files(paths: list[Path], out_path: Path) -> None:
 
 def _cut_video(input_path: Path, keep_segments: list[tuple[float, float]], out_dir: Path) -> Path:
     """
-    Recorta `keep_segments` de `input_path`: cada tramo a su propio
-    archivo aislado (_cut_segment, sin `concat` ni `filter_complex` -- ver
-    "Fuga de frames de vídeo en el filtro concat de ffmpeg" en el
-    docstring del módulo) y los pega después con el concat DEMUXER
-    (_glue_video_files). Sin límite práctico de nº de tramos: cada uno es
-    una llamada de ffmpeg independiente y corta, así que ni el nº de
-    tramos ni sus caracteres pueden acercar la línea de comandos al
-    límite de Windows.
+    Recorta `keep_segments` de `input_path` aplicando "renderizado
+    parcial sin pérdida" (ver docstring del módulo): cada tramo se corta
+    con _cut_segment_smart, que copia sin recodificar (-c copy) el
+    interior de cada tramo entre dos keyframes reales y solo recodifica
+    los bordes (o el tramo completo, como fallback, si es más corto que
+    un intervalo de keyframe) -- sin `concat` ni `filter_complex` en
+    ningún caso (ver "Fuga de frames de vídeo en el filtro concat de
+    ffmpeg"). Todos los fragmentos resultantes (1 a 3 por tramo) se pegan
+    después con el concat DEMUXER (_glue_video_files). Sin límite
+    práctico de nº de tramos: cada fragmento es una llamada de ffmpeg
+    independiente y corta, así que ni el nº de tramos ni sus caracteres
+    pueden acercar la línea de comandos al límite de Windows.
 
     Returns:
         Ruta al vídeo ya cortado, sin zoom (data/output/<video_id>/_cuts.mp4).
     """
+    t0 = time.monotonic()
+    keyframes = _scan_keyframe_timestamps(input_path)
     logger.info(
-        "Cortando %d tramo(s) a conservar (un archivo aislado por tramo, sin filtro concat)",
+        "%d keyframe(s) encontrados en %s (%.1fs, solo demux) para el renderizado parcial sin pérdida",
+        len(keyframes), input_path.name, time.monotonic() - t0,
+    )
+
+    logger.info(
+        "Cortando %d tramo(s) a conservar (interior copiado sin recodificar cuando hay hueco entre "
+        "keyframes; recodificación completa como fallback)",
         len(keep_segments),
     )
-    segment_paths = [
-        _cut_segment(input_path, start, end, i, len(keep_segments), out_dir)
-        for i, (start, end) in enumerate(keep_segments)
-    ]
+    segment_paths: list[Path] = []
+    n_partial = 0
+    n_full_recode = 0
+    for i, (start, end) in enumerate(keep_segments):
+        fragments = _cut_segment_smart(input_path, start, end, keyframes, i, len(keep_segments), out_dir)
+        segment_paths.extend(fragments)
+        if len(fragments) == 1:
+            n_full_recode += 1
+        else:
+            n_partial += 1
+    logger.info(
+        "%d tramo(s) con interior copiado sin recodificar, %d tramo(s) recodificados por completo "
+        "(sin hueco interior útil)",
+        n_partial, n_full_recode,
+    )
 
     cut_path = out_dir / "_cuts.mp4"
     if len(segment_paths) == 1:
