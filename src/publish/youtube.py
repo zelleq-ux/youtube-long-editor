@@ -36,12 +36,14 @@ la YouTube Data API v3 (videos().insert, subida resumable), adjuntando:
 
 Autenticación OAuth (flujo estándar de "instalar-app" de Google vía
 google-auth-oauthlib): la primera vez abre el navegador para que el
-usuario autorice el acceso (scopes youtube.upload -- videos().insert,
-thumbnails().set() -- y youtube.readonly -- channels().list(), ver
-verificación de canal más abajo) usando YOUTUBE_CLIENT_SECRET_PATH del
-.env, y guarda el resultado en token.json (raíz del repo, gitignored)
-para no repetir la autorización en cada ejecución; lo reutiliza y
-refresca automáticamente mientras el refresh token siga siendo válido.
+usuario autorice el acceso (scope youtube -- "Manage your YouTube
+account", cubre videos().insert(), thumbnails().set(),
+captions().insert() y channels().list(); ver _SCOPES sobre por qué un
+único scope amplio en vez de ir apilando scopes estrechos) usando
+YOUTUBE_CLIENT_SECRET_PATH del .env, y guarda el resultado en token.json
+(raíz del repo, gitignored) para no repetir la autorización en cada
+ejecución; lo reutiliza y refresca automáticamente mientras el refresh
+token siga siendo válido.
 
 IMPORTANTE -- no se sube nada de verdad salvo que se pida explícitamente:
 run() acepta `execute` (por defecto False). Con execute=False construye
@@ -91,8 +93,16 @@ from src.common.config import REPO_ROOT, load_config
 logger = logging.getLogger(__name__)
 
 _SCOPES = [
-    "https://www.googleapis.com/auth/youtube.upload",
-    "https://www.googleapis.com/auth/youtube.readonly",  # necesario para channels().list(mine=True), ver _verify_channel
+    # 2026-08-10, EN PRODUCCIÓN, tres rondas: youtube.upload solo no basta para
+    # channels().list(mine=True) (hace falta youtube.readonly) NI para captions().insert()
+    # (probado con el scope amplio "youtube" ("Manage your YouTube account") y SIGUE dando
+    # insufficientPermissions -- los endpoints de captions comprueban aparentemente
+    # youtube.force-ssl de forma específica, no basta con el scope general). Se piden los dos
+    # scopes amplios juntos para cubrir de una vez todo lo que este módulo hace (subir vídeo,
+    # miniatura, captions, listar el propio canal) y no seguir descubriendo scopes que faltan
+    # uno a uno -- cada uno cuesta una re-autorización nueva con el navegador.
+    "https://www.googleapis.com/auth/youtube",
+    "https://www.googleapis.com/auth/youtube.force-ssl",
 ]
 _TOKEN_PATH = REPO_ROOT / "token.json"
 
