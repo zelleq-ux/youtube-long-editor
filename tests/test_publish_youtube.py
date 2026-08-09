@@ -6,18 +6,29 @@ Cubre:
 1. _build_video_body: título/placeholder, descripción, privacidad --
    función pura.
 2. _description_from_chapters / _thumbnail_path / _final_video_path:
-   helpers de filesystem (chapters.txt/thumbnail.png opcionales,
-   final.mp4 obligatorio).
+   helpers de filesystem (chapters.txt opcional; final.mp4 y, desde
+   2026-08-09, thumbnail.png también SIEMPRE obligatorios -- ver más
+   abajo el porqué del cambio).
 3. run(execute=False) con un servicio de YouTube FALSO inyectado (mismo
    patrón `client` que thumbnail/detect_chapters): confirma que la
    petición (videos().insert) se construye con el body correcto y que
    NUNCA se llama a next_chunk()/execute() -- no se sube nada.
 4. run(execute=True) con el mismo servicio falso: confirma que sí se
    agota next_chunk() hasta la respuesta final, que se propaga el
-   youtube_video_id devuelto, y que thumbnails().set() se llama (con ese
-   mismo id) solo si hay thumbnail.png.
+   youtube_video_id devuelto, y que thumbnails().set() se llama con ese
+   mismo id.
 5. _execute_resumable_upload: reintenta ante HttpError 503 (transitorio)
    y no ante un HttpError 404 (no debe reintentar, debe propagar).
+6. captions().insert(): con execute=False NUNCA se llama (ni se construye
+   la petición) aunque exista subtitles.srt; con execute=True se llama una
+   vez con el videoId/idioma correctos y el contenido del .srt solo si
+   subtitles.srt existe -- y no se llama en absoluto si no existe (esto
+   SÍ sigue siendo opcional, a diferencia de thumbnail.png).
+7. thumbnail.png ya NO es opcional (2026-08-09: src/thumbnail/run.py dejó
+   de generarlo automáticamente, solo extrae frames candidatos; el
+   usuario lo crea a mano) -- run() debe lanzar FileNotFoundError con un
+   mensaje claro si no existe, ANTES de construir ninguna petición,
+   tanto con execute=False como con execute=True.
 
 Uso:
     cd <repo_root>
@@ -45,6 +56,7 @@ from src.publish.youtube import (  # noqa: E402
     _description_from_chapters,
     _execute_resumable_upload,
     _final_video_path,
+    _subtitles_path,
     _thumbnail_path,
     run,
 )
@@ -111,16 +123,39 @@ class _FakeThumbnailsResource:
         return _FakeThumbnailSetRequest(kwargs)
 
 
+class _FakeCaptionsInsertRequest:
+    def __init__(self, kwargs: dict):
+        self.kwargs = kwargs
+        self.executed = False
+
+    def execute(self):
+        self.executed = True
+        return {"id": "caption_abc"}
+
+
+class _FakeCaptionsResource:
+    def __init__(self):
+        self.insert_calls: list[dict] = []
+
+    def insert(self, **kwargs):
+        self.insert_calls.append(kwargs)
+        return _FakeCaptionsInsertRequest(kwargs)
+
+
 class _FakeYoutubeService:
     def __init__(self, final_response: dict, chunks_before_done: int = 1):
         self.videos_resource = _FakeVideosResource(final_response, chunks_before_done)
         self.thumbnails_resource = _FakeThumbnailsResource()
+        self.captions_resource = _FakeCaptionsResource()
 
     def videos(self):
         return self.videos_resource
 
     def thumbnails(self):
         return self.thumbnails_resource
+
+    def captions(self):
+        return self.captions_resource
 
 
 def _write_dummy_file(path: Path, content: bytes = b"dummy") -> None:
@@ -170,9 +205,21 @@ def main() -> int:
             f"desc={_description_from_chapters(video_id, config)!r}",
         )
 
-        check("_thumbnail_path sin thumbnail.png devuelve None", _thumbnail_path(video_id, config) is None)
+        try:
+            _thumbnail_path(video_id, config)
+            check("_thumbnail_path sin thumbnail.png lanza FileNotFoundError", False, "no lanzó excepción")
+        except FileNotFoundError as exc:
+            check(
+                "_thumbnail_path sin thumbnail.png lanza FileNotFoundError con el mensaje esperado",
+                "thumbnail.png no encontrado" in str(exc),
+                f"mensaje={exc}",
+            )
         _write_dummy_file(output_dir / "thumbnail.png")
-        check("_thumbnail_path con thumbnail.png devuelve su ruta", _thumbnail_path(video_id, config) is not None)
+        check("_thumbnail_path con thumbnail.png devuelve su ruta", _thumbnail_path(video_id, config).exists())
+
+        check("_subtitles_path sin subtitles.srt devuelve None", _subtitles_path(video_id, config) is None)
+        _write_dummy_file(output_dir / "subtitles.srt", content=b"1\n00:00:00,000 --> 00:00:01,000\nHola\n")
+        check("_subtitles_path con subtitles.srt devuelve su ruta", _subtitles_path(video_id, config) is not None)
 
         print("=== run(execute=False): construye la petición pero no sube nada ===")
         fake_service_dry = _FakeYoutubeService(final_response={"id": "should_not_be_used"})
@@ -207,8 +254,13 @@ def main() -> int:
             len(fake_service_dry.thumbnails_resource.set_calls) == 0,
         )
         check(
-            "execute=False: el resultado refleja executed=False y youtube_video_id=None",
-            result_dry["executed"] is False and result_dry["youtube_video_id"] is None and result_dry["thumbnail_attached"] is True,
+            "execute=False: captions().insert() nunca se llama, aunque exista subtitles.srt",
+            len(fake_service_dry.captions_resource.insert_calls) == 0,
+        )
+        check(
+            "execute=False: el resultado refleja executed=False, youtube_video_id=None y subtitles_attached=False",
+            result_dry["executed"] is False and result_dry["youtube_video_id"] is None
+            and result_dry["thumbnail_attached"] is True and result_dry["subtitles_attached"] is False,
             f"result={result_dry}",
         )
 
@@ -231,17 +283,72 @@ def main() -> int:
             and fake_service_real.thumbnails_resource.set_calls[0]["videoId"] == "yt_abc123",
             f"set_calls={fake_service_real.thumbnails_resource.set_calls}",
         )
-
-        print("=== run(execute=True) sin thumbnail.png: no llama a thumbnails().set() ===")
-        video_id_no_thumb = "no_thumb_video"
-        output_dir2 = work_dir / video_id_no_thumb
-        output_dir2.mkdir(parents=True)
-        _write_dummy_file(output_dir2 / "final.mp4")
-        fake_service_no_thumb = _FakeYoutubeService(final_response={"id": "yt_no_thumb"})
-        run(video_id_no_thumb, config, youtube_service=fake_service_no_thumb, execute=True)
         check(
-            "sin thumbnail.png: thumbnails().set() no se llama",
-            len(fake_service_no_thumb.thumbnails_resource.set_calls) == 0,
+            "execute=True: captions().insert() se llamó una vez con el videoId/idioma correctos",
+            len(fake_service_real.captions_resource.insert_calls) == 1
+            and fake_service_real.captions_resource.insert_calls[0]["body"]["snippet"]["videoId"] == "yt_abc123"
+            and fake_service_real.captions_resource.insert_calls[0]["body"]["snippet"]["language"] == "es"
+            and fake_service_real.captions_resource.insert_calls[0]["body"]["snippet"]["isDraft"] is False,
+            f"insert_calls={fake_service_real.captions_resource.insert_calls}",
+        )
+        check(
+            "execute=True: el resultado refleja subtitles_attached=True",
+            result_real["subtitles_attached"] is True,
+            f"result={result_real}",
+        )
+
+        print("=== run(execute=True) con --caption-language distinto: se propaga al body ===")
+        fake_service_lang = _FakeYoutubeService(final_response={"id": "yt_lang"})
+        run(video_id, config, youtube_service=fake_service_lang, execute=True, caption_language="en")
+        check(
+            "el idioma pasado se refleja en el body de captions().insert()",
+            fake_service_lang.captions_resource.insert_calls[0]["body"]["snippet"]["language"] == "en",
+            f"insert_calls={fake_service_lang.captions_resource.insert_calls}",
+        )
+
+        print("=== run(): sin thumbnail.png, falla con FileNotFoundError en vez de subir sin miniatura (execute=False y execute=True) ===")
+        video_id_no_thumb = "no_thumb_video"
+        output_dir_no_thumb = work_dir / video_id_no_thumb
+        output_dir_no_thumb.mkdir(parents=True)
+        _write_dummy_file(output_dir_no_thumb / "final.mp4")
+        fake_service_no_thumb_dry = _FakeYoutubeService(final_response={"id": "should_not_be_used"})
+        try:
+            run(video_id_no_thumb, config, youtube_service=fake_service_no_thumb_dry, execute=False)
+            check("sin thumbnail.png (execute=False): run() lanza FileNotFoundError", False, "no lanzó excepción")
+        except FileNotFoundError as exc:
+            check(
+                "sin thumbnail.png (execute=False): run() lanza FileNotFoundError con el mensaje esperado",
+                "thumbnail.png no encontrado" in str(exc),
+                f"mensaje={exc}",
+            )
+        check(
+            "sin thumbnail.png: nunca se llega a construir ninguna petición videos().insert()",
+            len(fake_service_no_thumb_dry.videos_resource.insert_calls) == 0,
+        )
+        fake_service_no_thumb_real = _FakeYoutubeService(final_response={"id": "should_not_be_used"})
+        try:
+            run(video_id_no_thumb, config, youtube_service=fake_service_no_thumb_real, execute=True)
+            check("sin thumbnail.png (execute=True): run() lanza FileNotFoundError", False, "no lanzó excepción")
+        except FileNotFoundError:
+            check("sin thumbnail.png (execute=True): run() lanza FileNotFoundError", True, "")
+
+        print("=== run(execute=True) con thumbnail.png pero SIN subtitles.srt: sigue subiendo, solo omite captions().insert() ===")
+        video_id_no_subs = "no_subs_video"
+        output_dir_no_subs = work_dir / video_id_no_subs
+        output_dir_no_subs.mkdir(parents=True)
+        _write_dummy_file(output_dir_no_subs / "final.mp4")
+        _write_dummy_file(output_dir_no_subs / "thumbnail.png")
+        fake_service_no_subs = _FakeYoutubeService(final_response={"id": "yt_no_subs"})
+        result_no_subs = run(video_id_no_subs, config, youtube_service=fake_service_no_subs, execute=True)
+        check(
+            "con thumbnail.png pero sin subtitles.srt: la subida sigue funcionando y adjunta la miniatura",
+            len(fake_service_no_subs.thumbnails_resource.set_calls) == 1,
+        )
+        check(
+            "sin subtitles.srt: captions().insert() no se llama y subtitles_attached=False",
+            len(fake_service_no_subs.captions_resource.insert_calls) == 0
+            and result_no_subs["subtitles_attached"] is False,
+            f"result={result_no_subs}",
         )
 
         print("=== _execute_resumable_upload: reintentos ante errores transitorios ===")

@@ -1,36 +1,39 @@
 """
-Test sintético (sin red, sin llamar a Claude/Gemini de verdad) de
-src/thumbnail/run.py.
+Test sintético (sin red, sin dependencias externas) de
+src/thumbnail/run.py -- versión drásticamente simplificada (2026-08-09):
+el módulo YA NO COMPONE NADA, solo extrae frames candidatos reales, a
+resolución completa, de los momentos de mayor movimiento del vídeo.
 
 Cubre:
-1. _group_speech_runs / _wrap_headline: funciones puras.
-2. _select_face_frame contra un vídeo sintético pequeño, con
-   detect_faces_at INYECTADO (mismo patrón que el parámetro `detector` de
-   detect_intro_face_cut) -- confirma que se elige el candidato con cara
-   detectada cuando solo uno de varios la tiene, y que cae a un frame de
-   respaldo sin lanzar excepción si ninguno la tiene.
-3. _select_gameplay_frame contra un vídeo sintético con movimiento SOLO en
-   una ventana de tiempo conocida fuera de facecam_region -- confirma que
-   elige un frame de esa ventana.
-4. _extract_headline con un cliente de Claude FALSO inyectado (mismo
-   patrón que detect_chapters_with_claude).
-5. _enhance_with_gemini con un cliente de Gemini FALSO inyectado --
-   confirma el camino de éxito y los tres caminos de fallback (excepción,
-   sin output_image, datos indecodificables) caen todos de vuelta a la
-   imagen compuesta sin modificar.
-6. _compose_thumbnail -- tamaño de canvas exacto y que quemar el texto
-   cambia píxeles respecto a no quemarlo.
+1. _select_candidate_frames detecta ráfagas de movimiento conocidas
+   dispersas por un vídeo sintético, incluyendo una ráfaga dentro de lo
+   que en las versiones anteriores de este módulo habría sido
+   `facecam_region` -- confirma que la puntuación ahora se calcula sobre
+   el FRAME COMPLETO, sin excluir ninguna zona (a diferencia de
+   _select_gameplay_frame de las versiones anteriores).
+2. --min-gap-seconds: dos ráfagas de movimiento cercanas en el tiempo
+   (más cerca entre sí que min_gap_seconds) colapsan en un solo
+   candidato (el de mayor movimiento de las dos); una tercera ráfaga
+   lejana se conserva como candidato aparte.
+3. Los candidatos dentro de un tramo ya marcado en
+   data/cuts/<video_id>/cuts.json se descartan.
+4. run(): guarda thumbnail_candidate_1.png..._N.png (1-indexado, orden
+   cronológico) a la resolución COMPLETA del vídeo de origen (sin
+   redimensionar); limpia candidatos de una ejecución anterior con más
+   candidatos que la actual; NUNCA crea ni toca thumbnail.png;
+   config['thumbnail']['enabled']=False no genera ningún archivo.
 
 Uso:
     cd <repo_root>
     python tests/test_thumbnail.py
 
-Genera sus propios vídeos/imágenes en un directorio temporal (no toca
-data/ ni llama a ninguna API real). Código de salida 0 si todas las
+Genera sus propios vídeos sintéticos en un directorio temporal (no toca
+data/ ni llama a ninguna API o red). Código de salida 0 si todas las
 comprobaciones pasan, 1 si alguna falla.
 """
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 import tempfile
@@ -42,18 +45,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.thumbnail.run import (  # noqa: E402
-    _HeadlineModel,
-    _CANVAS_HEIGHT,
-    _CANVAS_WIDTH,
-    _compose_thumbnail,
-    _enhance_with_gemini,
-    _extract_headline,
-    _group_speech_runs,
-    _select_face_frame,
-    _select_gameplay_frame,
-    _wrap_headline,
-)
+from src.thumbnail.run import _select_candidate_frames, run  # noqa: E402
 
 failures: list[str] = []
 
@@ -65,345 +57,167 @@ def check(label: str, condition: bool, detail: str = "") -> None:
         failures.append(f"{label}: {detail}")
 
 
-# ---------------------------------------------------------------------------
-# Fakes para Claude y Gemini (mismo patrón que test_detect_chapters.py)
-# ---------------------------------------------------------------------------
-
-class _FakeAnthropicResponse:
-    def __init__(self, stop_reason: str, parsed_output):
-        self.stop_reason = stop_reason
-        self.parsed_output = parsed_output
-
-
-class _FakeAnthropicMessages:
-    def __init__(self, response: _FakeAnthropicResponse):
-        self._response = response
-        self.calls: list[dict] = []
-
-    def parse(self, **kwargs):
-        self.calls.append(kwargs)
-        return self._response
-
-
-class _FakeAnthropicClient:
-    def __init__(self, response: _FakeAnthropicResponse):
-        self.messages = _FakeAnthropicMessages(response)
-
-
-class _FakeImagePart:
-    def __init__(self, data):
-        self.data = data
-
-
-class _FakeGeminiInteraction:
-    def __init__(self, output_image):
-        self.output_image = output_image
-
-
-class _FakeGeminiInteractions:
-    def __init__(self, result):
-        self._result = result  # una excepción para simular fallo, o una _FakeGeminiInteraction
-        self.calls: list[dict] = []
-
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-        if isinstance(self._result, Exception):
-            raise self._result
-        return self._result
-
-
-class _FakeGeminiClient:
-    def __init__(self, result):
-        self.interactions = _FakeGeminiInteractions(result)
-
-
-def _png_bytes_of(color: tuple[int, int, int]) -> bytes:
-    import io as _io
-    from PIL import Image as _Image
-    buf = _io.BytesIO()
-    _Image.new("RGB", (8, 8), color=color).save(buf, format="PNG")
-    return buf.getvalue()
-
-
-# ---------------------------------------------------------------------------
-# Vídeos sintéticos
-# ---------------------------------------------------------------------------
-
 WIDTH, HEIGHT = 420, 200
 FPS = 10.0
-FACECAM_REGION = {"x": 20, "y": 20, "w": 160, "h": 120}
+# Región que en las versiones anteriores de este módulo era `facecam_region` --
+# usada aquí SOLO para comprobar que ya no se excluye de nada.
+_OLD_FACECAM_REGION_BOX = (20, 20, 180, 140)  # x0, y0, x1, y1
 _RNG = np.random.default_rng(20260809)
 _BACKGROUND = _RNG.integers(0, 40, size=(HEIGHT, WIDTH, 3), dtype=np.uint8)
 
 
-def _write_simple_video(path: Path, duration_s: float) -> None:
-    """Vídeo con textura fija, sin movimiento -- para el test de _select_face_frame (la detección va inyectada)."""
+def _write_motion_video(path: Path, duration_s: float, bursts: list[dict]) -> None:
+    """
+    Vídeo con textura de fondo fija y, dentro de cada ráfaga de `bursts`
+    (dict con "window": (start, end), "box": (x0,y0,x1,y1) contenedor del
+    marcador que rebota, "max_offset": amplitud del rebote), un marcador
+    blanco que se mueve SOLO durante esa ventana -- fuera de todas las
+    ráfagas, el frame es la textura de fondo sin cambios (movimiento ~0).
+    """
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(path), fourcc, FPS, (WIDTH, HEIGHT))
     n_frames = int(duration_s * FPS)
-    for _ in range(n_frames):
-        writer.write(_BACKGROUND.copy())
-    writer.release()
+    object_size = (24, 24)
 
+    def _offset_at(t: float, burst: dict) -> int | None:
+        start, end = burst["window"]
+        if not (start <= t < end):
+            return None
+        local = (t - start) / (end - start)
+        period = 2.0
+        phase = (local * period) % period
+        frac = phase if phase <= 1.0 else 2.0 - phase
+        return round(frac * burst["max_offset"])
 
-def _write_gameplay_video(path: Path, duration_s: float, active_window: tuple[float, float]) -> None:
-    """
-    Vídeo con un marcador que rebota SOLO dentro de `active_window`
-    (segundos), en un contenedor FUERA de FACECAM_REGION; el resto del
-    tiempo el marcador se queda fijo en su posición de reposo -- mismo
-    patrón de margen que tests/test_motion_facecam_exclusion.py.
-    """
-    container = {"x": 250, "y": 50, "w": 100, "h": 100}
-    object_size = (40, 40)
-    margin = 15
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(path), fourcc, FPS, (WIDTH, HEIGHT))
-    n_frames = int(duration_s * FPS)
-    inner_x0 = container["x"] + margin
-    inner_y0 = container["y"] + margin
-    max_offset = max(0, (container["w"] - 2 * margin) - object_size[0])
-    win_start, win_end = active_window
     for i in range(n_frames):
         t = i / FPS
         frame = _BACKGROUND.copy()
-        if win_start <= t < win_end and max_offset > 0:
-            local = (t - win_start) / (win_end - win_start)
-            period = 2.0
-            phase = (local * period) % period
-            frac = phase if phase <= 1.0 else 2.0 - phase
-            offset = round(frac * max_offset)
-        else:
-            offset = 0
-        x, y = inner_x0 + offset, inner_y0
-        frame[y:y + object_size[1], x:x + object_size[0]] = 255
+        for burst in bursts:
+            offset = _offset_at(t, burst)
+            if offset is None:
+                continue
+            x0, y0, x1, y1 = burst["box"]
+            margin = 6
+            max_extent = max(0, (x1 - x0 - 2 * margin) - object_size[0])
+            actual_offset = min(offset, max_extent)
+            x, y = x0 + margin + actual_offset, y0 + margin
+            frame[y:y + object_size[1], x:x + object_size[0]] = 255
         writer.write(frame)
     writer.release()
-
-
-def _make_speech_transcript() -> dict:
-    """Dos tramos de habla larga (>=10s, separados por un hueco de 5s > 1.2s) -- 4 candidatos en orden."""
-    words = []
-    idx = 0
-    for run_start, run_end in [(0.0, 15.0), (20.0, 35.0)]:
-        t = run_start
-        while t < run_end:
-            words.append({"word": f"w{idx}", "start": round(t, 3), "end": round(t + 0.3, 3)})
-            t += 0.4
-            idx += 1
-    return {"duration_s": 40.0, "segments": [], "words": words}
 
 
 def main() -> int:
     work_dir = Path(tempfile.mkdtemp(prefix="thumbnail_test_"))
     try:
         config = {
-            "paths": {"raw": str(work_dir), "transcripts": str(work_dir), "output": str(work_dir)},
-            "facecam_region": FACECAM_REGION,
-            "edit": {"long_speech_min_seconds": 10.0, "long_speech_gap_seconds": 1.2},
-            "thumbnail": {"face_candidate_segments": 3, "gameplay_candidate_count": 5},
+            "paths": {"raw": str(work_dir), "output": str(work_dir)},
+            "thumbnail": {"candidate_sample_count": 40},
         }
 
-        print("=== Funciones puras ===")
-        transcript = _make_speech_transcript()
-        runs = _group_speech_runs(transcript, config)
-        check(
-            "_group_speech_runs detecta exactamente 2 tramos, empezando en 0.0 y 20.0, ambos >= 10s",
-            len(runs) == 2 and runs[0][0] == 0.0 and runs[1][0] == 20.0
-            and (runs[0][1] - runs[0][0]) >= 10.0 and (runs[1][1] - runs[1][0]) >= 10.0,
-            f"runs={runs}",
-        )
-        check("_wrap_headline deja 1-2 palabras en una línea", _wrap_headline("GANA") == ["GANA"])
-        check(
-            "_wrap_headline parte titulares largos en 2 líneas",
-            _wrap_headline("ESTO NO ME LO ESPERABA NUNCA") == ["ESTO NO ME", "LO ESPERABA NUNCA"],
-            f"={_wrap_headline('ESTO NO ME LO ESPERABA NUNCA')}",
-        )
+        print("=== _select_candidate_frames: detecta ráfagas dispersas, incluida una dentro de 'facecam_region' ===")
+        video_id = "motion_test"
+        # A: dentro de la región que antes era facecam_region (x0-x1: 20-180, y0-y1: 20-140).
+        # B: fuera, más fuerte que C.
+        # C: fuera, cerca de B en el tiempo (< min_gap_seconds de diferencia) pero más débil.
+        # D: fuera, lejos de todas las demás.
+        bursts = [
+            {"name": "A", "window": (10.0, 12.0), "box": _OLD_FACECAM_REGION_BOX, "max_offset": 60},
+            {"name": "B", "window": (30.0, 32.0), "box": (250, 30, 350, 130), "max_offset": 60},
+            {"name": "C", "window": (33.0, 35.0), "box": (250, 30, 350, 130), "max_offset": 20},
+            {"name": "D", "window": (50.0, 52.0), "box": (250, 30, 350, 130), "max_offset": 60},
+        ]
+        _write_motion_video(work_dir / f"{video_id}.mp4", duration_s=60.0, bursts=bursts)
 
-        print("=== _select_face_frame (vídeo sintético + detector inyectado) ===")
-        face_video_id = "face_test"
-        _write_simple_video(work_dir / f"{face_video_id}.mp4", duration_s=40.0)
-        with open(work_dir / f"{face_video_id}.json", "w", encoding="utf-8") as f:
-            import json as _json
-            _json.dump(transcript, f)
-
-        # Candidatos = 35%/70% de cada tramo, en el mismo orden que
-        # _select_face_frame -- derivado de `runs` en vez de calculado a
-        # mano, para no arrastrar errores de aritmética al test.
-        expected_candidate_times = []
-        for start, end in runs:
-            dur = end - start
-            expected_candidate_times.append(start + dur * 0.35)
-            expected_candidate_times.append(start + dur * 0.7)
-        third_candidate_t = expected_candidate_times[2]
-
-        call_state = {"count": 0}
-
-        def detect_only_third_call(frame, crop_box):
-            i = call_state["count"]
-            call_state["count"] += 1
-            if i == 2:
-                return np.array([[0, 0, 10, 10, *([0.0] * 10), 0.95]])
-            return None
-
-        chosen_frame = _select_face_frame(face_video_id, config, detect_faces_at=detect_only_third_call)
-
-        cap = cv2.VideoCapture(str(work_dir / f"{face_video_id}.mp4"), cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_POS_MSEC, third_candidate_t * 1000)
-        ok, expected_frame = cap.read()
-        cap.release()
+        candidates = _select_candidate_frames(video_id, config, num_candidates=3, min_gap_seconds=10.0)
+        candidate_times = [t for t, _ in candidates]
 
         check(
-            "se llamó al detector inyectado 4 veces (una por candidato)",
-            call_state["count"] == 4,
-            f"count={call_state['count']}",
+            "se devuelven como mucho 3 candidatos, en orden cronológico",
+            len(candidates) <= 3 and candidate_times == sorted(candidate_times),
+            f"times={candidate_times}",
         )
+        near_a = any(9.0 <= t <= 13.0 for t in candidate_times)
         check(
-            f"el candidato con cara detectada (3º, t={third_candidate_t:.3f}s) es el elegido",
-            ok and np.array_equal(chosen_frame, expected_frame),
-            f"chosen == frame at t={third_candidate_t:.3f}s: {ok and np.array_equal(chosen_frame, expected_frame)}",
+            "se detecta la ráfaga A, DENTRO de lo que antes era facecam_region (ya no se excluye nada)",
+            near_a,
+            f"times={candidate_times}",
+        )
+        near_b = any(29.0 <= t <= 33.0 for t in candidate_times)
+        near_c = any(32.0 <= t <= 36.0 for t in candidate_times)
+        check(
+            "de B y C (a < 10s de diferencia, min_gap_seconds=10), solo sobrevive UNO -- el más fuerte (B)",
+            near_b and not near_c,
+            f"near_b={near_b}, near_c={near_c}, times={candidate_times}",
+        )
+        near_d = any(49.0 <= t <= 53.0 for t in candidate_times)
+        check(
+            "se detecta la ráfaga D, lejos de las demás",
+            near_d,
+            f"times={candidate_times}",
         )
 
-        # Ningún candidato con cara -> no debe lanzar excepción, cae al de respaldo.
-        fallback_frame = _select_face_frame(face_video_id, config, detect_faces_at=lambda frame, box: None)
-        check(
-            "sin ningún candidato con cara detectada, cae a un frame de respaldo sin fallar",
-            isinstance(fallback_frame, np.ndarray) and fallback_frame.shape == (HEIGHT, WIDTH, 3),
-            f"fallback_frame={type(fallback_frame)}",
-        )
-
-        print("=== _select_face_frame ignora tramos dentro de un corte ya detectado (p.ej. intro) ===")
-        # cuts.json marca [0, 18) como corte de intro -- cubre el primer tramo
-        # de habla (0.0-15.1s) por completo, pero no el segundo (20.0-35.1s).
-        # Encontrado con una generación real contra dinoblade_1: sin este
-        # filtro, face_candidate_segments=3 podía elegir sus 3 tramos
-        # exclusivamente dentro de la intro (~17 min sin facecam_region en su
-        # disposición normal), produciendo un recorte de cara en blanco.
-        cuts_dir = work_dir / face_video_id
+        print("=== _select_candidate_frames: descarta candidatos dentro de un tramo ya cortado (cuts.json) ===")
+        video_id2 = "motion_cuts_test"
+        bursts2 = [
+            {"name": "cut", "window": (10.0, 12.0), "box": (250, 30, 350, 130), "max_offset": 60},
+            {"name": "keep", "window": (40.0, 42.0), "box": (250, 30, 350, 130), "max_offset": 40},
+        ]
+        _write_motion_video(work_dir / f"{video_id2}.mp4", duration_s=60.0, bursts=bursts2)
+        cuts_dir = work_dir / video_id2
         cuts_dir.mkdir(exist_ok=True)
         with open(cuts_dir / "cuts.json", "w", encoding="utf-8") as f:
-            import json as _json
-            _json.dump([{"start": 0.0, "end": 18.0, "type": "intro", "reason": "intro sin cara"}], f)
+            json.dump([{"start": 8.0, "end": 14.0, "type": "silence", "reason": "s"}], f)
         config_with_cuts = {**config, "paths": {**config["paths"], "cuts": str(work_dir)}}
 
-        run2_start, run2_end = runs[1]
-        run2_dur = run2_end - run2_start
-        run2_candidate_times = [run2_start + run2_dur * 0.35, run2_start + run2_dur * 0.7]
-        run2_frames = []
-        cap = cv2.VideoCapture(str(work_dir / f"{face_video_id}.mp4"), cv2.CAP_FFMPEG)
-        for t in run2_candidate_times:
-            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-            ok, f_ = cap.read()
-            run2_frames.append(f_ if ok else None)
-        cap.release()
-
-        chosen_after_cut_filter = _select_face_frame(
-            face_video_id, config_with_cuts, detect_faces_at=lambda frame, box: np.array([[0, 0, 10, 10, *([0.0] * 10), 0.9]])
-        )
+        candidates2 = _select_candidate_frames(video_id2, config_with_cuts, num_candidates=1, min_gap_seconds=5.0)
         check(
-            "el candidato elegido viene del 2º tramo (el 1º cae dentro del corte de intro)",
-            any(f_ is not None and np.array_equal(chosen_after_cut_filter, f_) for f_ in run2_frames),
-            "chosen_after_cut_filter coincide con alguno de los frames candidatos del 2º tramo",
+            "el único candidato devuelto viene del tramo NO cortado (~40-42s), no del cortado (~10-12s)",
+            len(candidates2) == 1 and 38.0 <= candidates2[0][0] <= 44.0,
+            f"candidates={[t for t, _ in candidates2]}",
         )
 
-        print("=== _select_gameplay_frame (vídeo sintético, movimiento en ventana conocida) ===")
-        gameplay_video_id = "gameplay_test"
-        # gameplay_candidate_count=5 sobre duración 10s, margen 10% -> candidatos en
-        # [1.0, 3.0, 5.0, 7.0, 9.0]; movimiento SOLO en [4.0, 6.0) -> solo el candidato
-        # t=5.0 (comparando 4.5 vs 5.0) debería mostrar variación no nula.
-        _write_gameplay_video(work_dir / f"{gameplay_video_id}.mp4", duration_s=10.0, active_window=(4.0, 6.0))
-        chosen_gameplay = _select_gameplay_frame(gameplay_video_id, config)
-
-        cap = cv2.VideoCapture(str(work_dir / f"{gameplay_video_id}.mp4"), cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_POS_MSEC, 5.0 * 1000)
-        ok, expected_gameplay_frame = cap.read()
-        cap.release()
-
+        print("=== run(): guarda thumbnail_candidate_N.png a resolución completa, sin tocar thumbnail.png ===")
+        output_dir = work_dir / video_id
+        result = run(video_id, config, num_candidates=3, min_gap_seconds=10.0)
         check(
-            "se elige un frame de la ventana de movimiento esperada (t=5.0s)",
-            ok and np.array_equal(chosen_gameplay, expected_gameplay_frame),
-            f"chosen == frame at t=5.0s: {ok and np.array_equal(chosen_gameplay, expected_gameplay_frame)}",
+            "run() devuelve exactamente las rutas de los candidatos guardados",
+            len(result["candidate_paths"]) == len(candidates) and len(result["candidate_paths"]) > 0,
+            f"paths={result['candidate_paths']}",
         )
-
-        print("=== _extract_headline (cliente de Claude falso) ===")
-        fake_output = _HeadlineModel(headline="NO ME LO ESPERABA")
-        fake_client = _FakeAnthropicClient(_FakeAnthropicResponse(stop_reason="end_turn", parsed_output=fake_output))
-        transcript_with_segments = {
-            "segments": [{"start": 12.0, "text": "no me lo esperaba para nada"}],
-        }
-        headline = _extract_headline(transcript_with_segments, {"detect_chapters": {"claude_model": "claude-sonnet-5"}}, client=fake_client)
-        check("_extract_headline devuelve el titular del cliente falso", headline == "NO ME LO ESPERABA", f"headline={headline!r}")
+        for i, path_str in enumerate(result["candidate_paths"], start=1):
+            path = Path(path_str)
+            check(f"candidato {i}: nombre de archivo esperado", path.name == f"thumbnail_candidate_{i}.png")
+            check(f"candidato {i}: el archivo existe", path.exists())
+            img = cv2.imread(str(path))
+            check(
+                f"candidato {i}: guardado a la resolución COMPLETA del vídeo de origen (sin redimensionar)",
+                img is not None and img.shape[:2] == (HEIGHT, WIDTH),
+                f"shape={None if img is None else img.shape}",
+            )
         check(
-            "la llamada usa el modelo de la config",
-            fake_client.messages.calls[0].get("model") == "claude-sonnet-5",
-            f"model={fake_client.messages.calls[0].get('model')!r}",
+            "run() NUNCA crea ni toca data/output/<video_id>/thumbnail.png",
+            not (output_dir / "thumbnail.png").exists(),
         )
 
-        refusal_client = _FakeAnthropicClient(_FakeAnthropicResponse(stop_reason="refusal", parsed_output=None))
-        try:
-            _extract_headline(transcript_with_segments, {}, client=refusal_client)
-            check("un refusal de Claude lanza RuntimeError", False, "no se lanzó ninguna excepción")
-        except RuntimeError:
-            check("un refusal de Claude lanza RuntimeError", True, "")
-
-        print("=== _compose_thumbnail ===")
-        face_frame = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
-        face_frame[:, :] = (200, 100, 50)
-        gameplay_frame = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
-        gameplay_frame[:, :] = (10, 10, 10)
-
-        composed_no_text = _compose_thumbnail(face_frame, gameplay_frame, FACECAM_REGION, "TITULO", burn_text=False)
-        composed_with_text = _compose_thumbnail(face_frame, gameplay_frame, FACECAM_REGION, "TITULO", burn_text=True)
+        print("=== run(): limpia candidatos de una ejecución anterior con más candidatos que la actual ===")
+        run(video_id, config, num_candidates=1, min_gap_seconds=10.0)
+        remaining = sorted(output_dir.glob("thumbnail_candidate_*.png"))
         check(
-            "_compose_thumbnail produce un canvas de exactamente 1280x720",
-            composed_no_text.size == (_CANVAS_WIDTH, _CANVAS_HEIGHT) == (1280, 720),
-            f"size={composed_no_text.size}",
-        )
-        diff_pixels = np.array(composed_no_text) != np.array(composed_with_text)
-        check(
-            "quemar el texto cambia píxeles respecto a no quemarlo",
-            bool(diff_pixels.any()),
-            "las dos composiciones son idénticas",
+            "tras pedir 1 candidato, no quedan restos de la ejecución anterior con más candidatos",
+            [p.name for p in remaining] == ["thumbnail_candidate_1.png"],
+            f"remaining={[p.name for p in remaining]}",
         )
 
-        print("=== _enhance_with_gemini (cliente de Gemini falso) ===")
-        success_bytes = _png_bytes_of((1, 2, 3))
-        import base64 as _base64
-        success_client = _FakeGeminiClient(
-            _FakeGeminiInteraction(output_image=_FakeImagePart(data=_base64.b64encode(success_bytes).decode("utf-8")))
-        )
-        result_img, enhanced = _enhance_with_gemini(composed_no_text, "TITULO", {"thumbnail": {}}, client=success_client)
-        check("camino de éxito: enhanced=True", enhanced is True)
-        check("camino de éxito: la imagen resultante viene de Gemini (no la original)", result_img.size == (8, 8), f"size={result_img.size}")
-
-        exception_client = _FakeGeminiClient(RuntimeError("fallo simulado de red"))
-        result_img2, enhanced2 = _enhance_with_gemini(composed_no_text, "TITULO", {"thumbnail": {}}, client=exception_client)
+        print("=== run() con config['thumbnail']['enabled']=False: no genera ningún archivo ===")
+        video_id3 = "disabled_test"
+        _write_motion_video(work_dir / f"{video_id3}.mp4", duration_s=20.0, bursts=[])
+        config_disabled = {**config, "thumbnail": {**config["thumbnail"], "enabled": False}}
+        result_disabled = run(video_id3, config_disabled)
         check(
-            "camino de fallo (excepción): cae a la composición original",
-            enhanced2 is False and result_img2 is composed_no_text,
-        )
-
-        no_image_client = _FakeGeminiClient(_FakeGeminiInteraction(output_image=None))
-        result_img3, enhanced3 = _enhance_with_gemini(composed_no_text, "TITULO", {"thumbnail": {}}, client=no_image_client)
-        check(
-            "camino de fallo (sin output_image): cae a la composición original",
-            enhanced3 is False and result_img3 is composed_no_text,
-        )
-
-        bad_data_client = _FakeGeminiClient(
-            _FakeGeminiInteraction(output_image=_FakeImagePart(data="esto no es base64 de una imagen valida!!"))
-        )
-        result_img4, enhanced4 = _enhance_with_gemini(composed_no_text, "TITULO", {"thumbnail": {}}, client=bad_data_client)
-        check(
-            "camino de fallo (datos indecodificables): cae a la composición original",
-            enhanced4 is False and result_img4 is composed_no_text,
-        )
-
-        no_key_result, no_key_enhanced = _enhance_with_gemini(
-            composed_no_text, "TITULO", {"thumbnail": {}, "_env": {"gemini_api_key": None}}, client=None
-        )
-        check(
-            "sin GEMINI_API_KEY configurada: cae a la composición original sin intentar llamar",
-            no_key_enhanced is False and no_key_result is composed_no_text,
+            "candidate_paths vacío y no se crea ningún archivo",
+            result_disabled["candidate_paths"] == []
+            and not list((work_dir / video_id3).glob("thumbnail_candidate_*.png")) if (work_dir / video_id3).exists() else True,
+            f"result={result_disabled}",
         )
 
     finally:
@@ -415,7 +229,7 @@ def main() -> int:
             print(f"  - {f}")
         return 1
 
-    print("\nOK: selección de frames, titular y mejora con Gemini se comportan como se espera.")
+    print("\nOK: extracción de frames candidatos por movimiento, deduplicado por tiempo, filtro de cortes y guardado se comportan como se espera.")
     return 0
 
 

@@ -24,7 +24,8 @@ src/transcribe/       -> whisper -> transcripción con timestamps
 src/detect_cuts/      -> silencios de audio + movimiento visual + muletillas -> lista de cortes
 src/detect_chapters/  -> bloques temáticos de la transcripción -> capítulos con timestamp+título
 src/edit/             -> aplica cortes (+ micro-zoom), normaliza audio, añade outro
-src/thumbnail/        -> compone la miniatura de YouTube a partir de frames reales + Claude + Gemini
+src/subtitles/        -> genera la pista de subtítulos (.srt) del vídeo ya editado
+src/thumbnail/        -> extrae frames candidatos a miniatura (el usuario compone la miniatura final a mano)
 src/publish/          -> sube el vídeo ya editado a YouTube (YouTube Data API v3)
 src/common/           -> config, db, utilidades compartidas con el otro proyecto (adaptar si hace falta)
 ```
@@ -37,7 +38,9 @@ src/common/           -> config, db, utilidades compartidas con el otro proyecto
 - `data/chapters/<video_id>/chapters.json` — `[{timestamp_s, title}]`
 - `data/output/<video_id>/final.mp4` — vídeo final editado
 - `data/output/<video_id>/chapters.txt` — capítulos en formato listo para pegar en YouTube (`00:00 Introducción`, etc.)
-- `data/output/<video_id>/thumbnail.png` — miniatura de YouTube (1280x720)
+- `data/output/<video_id>/subtitles.srt` — subtítulos del vídeo ya editado, formato .srt estándar
+- `data/output/<video_id>/thumbnail_candidate_<N>.png` — frames candidatos a miniatura (resolución completa, sin componer) que genera `src/thumbnail/run.py`
+- `data/output/<video_id>/thumbnail.png` — miniatura FINAL de YouTube, creada a mano por el usuario a partir de uno de los candidatos (ver más abajo) — `src/thumbnail/run.py` nunca escribe este archivo
 
 ### Regla clave: silencio + acción visual NO se corta
 
@@ -138,50 +141,68 @@ remapean a la línea de tiempo ya cortada restando la duración acumulada de
 los cortes anteriores a cada punto — el mismo remapeo que hace falta para
 los capítulos, ver más abajo.
 
+### Subtítulos
+
+`src/subtitles/run.py` genera `data/output/<video_id>/subtitles.srt` a
+partir de `data/transcripts/<video_id>.json` (timestamps por palabra) y
+`data/cuts/<video_id>/cuts.json`, remapeando cada palabra a la línea de
+tiempo YA EDITADA con `map_to_edited_timeline` de `src/common/timeline.py`
+(la misma utilidad que usan `edit/` y `detect_chapters/`) y descartando
+las palabras cuyo audio cae dentro de un tramo cortado. Las palabras
+conservadas se agrupan en líneas de subtítulo con el estándar de la
+industria para contenido largo (estilo estático, sin animación): máximo
+42 caracteres por línea, máximo 2 líneas por subtítulo, cada subtítulo
+entre 1 y 6 segundos en pantalla, ritmo de lectura de referencia ~15-20
+caracteres/segundo, y el corte entre subtítulos consecutivos prefiere caer
+en una pausa natural (puntuación o un hueco largo entre palabras) en vez
+de a mitad de frase. `config['subtitles']['enabled']` (default true)
+desactiva el módulo entero sin tocar código.
+
+IMPORTANTE -- calibración contra el vídeo final real: `map_to_edited_timeline`
+asume que cada corte elimina exactamente `end - start` segundos, pero el
+"renderizado parcial sin pérdida" de `edit/` redondea al frame más cercano
+en cada corte (siempre hacia MÁS contenido conservado, ver más abajo) y
+ese redondeo se ACUMULA con los cortes -- imperceptible con pocos cortes,
+pero varios segundos de deriva con los cientos de cortes reales de una
+grabación de 1-2h, suficiente para que los subtítulos se perciban
+desincronizados. `subtitles/` corrige esto calibrando contra la duración
+REAL del contenido principal en `data/output/<video_id>/final.mp4` (si ya
+existe): la diferencia frente a la duración nominal de `cuts.json` se
+reparte a partes iguales entre los cortes y se suma a cada palabra según
+cuántos cortes la preceden. Por eso `subtitles/` debe ejecutarse DESPUÉS
+de `edit/` en el pipeline (ver "Comandos útiles") -- sin `final.mp4`
+todavía, o si la deriva medida es implausible, se cae de vuelta al
+remapeo sin calibrar en vez de fallar.
+
 ### Miniatura de YouTube (thumbnail)
 
-`src/thumbnail/run.py` compone `data/output/<video_id>/thumbnail.png`
-(1280x720) SIEMPRE a partir de frames reales del vídeo, nunca inventando
-una imagen desde cero:
+`src/thumbnail/run.py` NO compone ninguna miniatura (simplificado
+drásticamente 2026-08-09 -- las dos versiones anteriores sí componían,
+primero con paneles con borde + titular vía Claude + mejora con Gemini,
+después con recorte de sujeto vía `rembg` + fondo desenfocado + título
+quemado; ambos diseños quedan retirados por completo, ver `status.md` si
+hace falta el detalle). Se limita a EXTRAER `--num-candidates` (default
+5) frames reales, a la resolución COMPLETA del vídeo original (sin
+recortar, sin excluir ninguna zona del frame, sin redimensionar), de los
+momentos de mayor movimiento del directo, guardados como
+`data/output/<video_id>/thumbnail_candidate_<N>.png` (orden cronológico).
+Reutiliza la misma señal ligera de movimiento que usaban las versiones
+anteriores de este módulo (diferencia media de píxeles en gris respecto
+al frame ~0.5s antes -- deliberadamente más barato que el optical flow
+denso de `detect_cuts`, para que extraer candidatos siga siendo cosa de
+segundos), pero ahora sobre el FRAME COMPLETO (streamer + juego visibles
+juntos, sin excluir `facecam_region` de nada). De los candidatos con más
+movimiento se eligen los de mayor puntuación que queden separados entre
+sí por al menos `--min-gap-seconds` (default 60s) -- evita quedarse con
+varios frames casi idénticos del mismo instante de acción.
 
-1. Elige un frame real de `facecam_region` con expresión animada:
-   muestrea un par de puntos dentro de cada uno de los primeros
-   `config['thumbnail']['face_candidate_segments']` tramos de habla larga
-   (mismo criterio que el zoom hacia la webcam de arriba) y, de los
-   candidatos con una cara bien detectada (reutiliza el detector YuNet de
-   `src/common/face_detection.py`, el mismo que usa el recorte de intro),
-   elige el de mayor variación respecto al frame ~0.5s antes.
-2. Elige un frame real de la zona de juego (fuera de `facecam_region`) en
-   un momento de alto movimiento: muestrea
-   `config['thumbnail']['gameplay_candidate_count']` puntos por el vídeo
-   y se queda con el de mayor variación de píxeles, EXCLUYENDO
-   `facecam_region` del cálculo (misma idea que
-   `exclude_facecam_from_motion` de `detect_cuts`). Deliberadamente más
-   ligero que `compute_motion_timeseries` (diferencia de píxeles en vez
-   de optical flow denso, un puñado de candidatos en vez de recorrer el
-   vídeo entero) — generar una miniatura debe tardar segundos, no los
-   minutos que tarda el análisis de movimiento completo de `detect_cuts`.
-3. Analiza la transcripción completa con Claude
-   (`config['detect_chapters']['claude_model']`, mismo modelo/patrón de
-   structured outputs que `detect_chapters`) para encontrar el momento
-   más "punchy"/gancho del vídeo y proponer un titular corto (3-6
-   palabras).
-4. Compón ambos frames con Pillow (composición de imagen normal, sin
-   IA): gameplay a pantalla completa de fondo, panel de cara con borde en
-   una esquina, y el titular quemado encima con fuente/color/contorno
-   controlados por nosotros si `config['thumbnail']['text_rendering']` es
-   `"pillow"` (por defecto).
-5. Mejora de estilo (contraste, iluminación "profesional") con Gemini
-   ("Nano Banana", `config['thumbnail']['gemini_model']`, `GEMINI_API_KEY`
-   del `.env`) SOLO sobre la composición ya armada del paso anterior — el
-   prompt le pide explícitamente conservar la composición y el contenido
-   real, nunca generar una imagen nueva. Si `text_rendering` es
-   `"gemini"` en vez de `"pillow"`, el titular no se quema en el paso 4 y
-   se le pide a Gemini que lo añada aquí. Si la llamada falla, no
-   devuelve imagen, o `GEMINI_API_KEY` no está configurada, se cae de
-   vuelta a la composición de Pillow sin modificar en vez de fallar el
-   módulo entero — una miniatura sin mejorar sigue siendo mejor que
-   ninguna.
+El usuario elige uno de los candidatos, lo compone a mano (título,
+recortes, cualquier otro elemento) con su propio editor, y guarda el
+resultado como `data/output/<video_id>/thumbnail.png` -- la ruta que
+sigue consumiendo `publish/youtube.py` sin cambios. Ese módulo ahora
+lanza `FileNotFoundError` con un mensaje claro ("thumbnail.png no
+encontrado, generar/elegir uno primero") si ese archivo no existe
+todavía, en vez de subir el vídeo sin miniatura en silencio.
 
 `config['thumbnail']['enabled']` (por defecto true) desactiva el módulo
 entero sin tocar código: si es false, `run()` no hace nada y lo deja
@@ -192,11 +213,16 @@ claro en el log.
 `src/publish/youtube.py` sube `data/output/<video_id>/final.mp4` a
 YouTube vía la YouTube Data API v3 (`videos().insert`, subida resumable),
 con título (por parámetro, o un placeholder marcado como pendiente si no
-se da ninguno), descripción (pega `chapters.txt` si existe) y miniatura
-(`thumbnail.png` si existe, vía `thumbnails().set()`, adjuntada después
-de que YouTube devuelva el id del vídeo subido). `privacy_status` es
-SIEMPRE `"private"` por defecto — nunca `"public"` ni `"unlisted"` salvo
-que se pida explícitamente.
+se da ninguno), descripción (pega `chapters.txt` si existe), miniatura
+(`thumbnail.png` -- SIEMPRE obligatoria desde 2026-08-09, ver sección de
+arriba: `run()` lanza `FileNotFoundError` con un mensaje claro si no
+existe todavía, en vez de subir sin miniatura; vía `thumbnails().set()`,
+adjuntada después de que YouTube devuelva el id del vídeo subido) y
+subtítulos (`subtitles.srt` si existe -- este sí sigue siendo opcional,
+vía `captions().insert()`, adjuntados también después de que exista el
+id del vídeo, en español por defecto). `privacy_status` es SIEMPRE
+`"private"` por defecto — nunca `"public"` ni `"unlisted"` salvo que se
+pida explícitamente.
 
 Autenticación OAuth estándar (`google-auth-oauthlib`,
 `YOUTUBE_CLIENT_SECRET_PATH` del `.env`): la primera vez abre el
@@ -209,7 +235,11 @@ nada de verdad salvo que se pida `execute=True` explícito (`--execute` en
 el CLI); por defecto (`execute=False`) construye la petición completa
 (credenciales, body, `MediaFileUpload`) y se detiene ahí SIN llamar a
 `.execute()`, para poder verificar que todo está bien construido sin
-gastar cuota de subida real ni crear un vídeo de verdad en el canal.
+gastar cuota de subida real ni crear un vídeo de verdad en el canal. Los
+subtítulos son la única excepción a "siempre se construye la petición
+aunque no se ejecute": `captions().insert()` necesita el id que devuelve
+YouTube al subir el vídeo, así que con `execute=False` no se construye ni
+se llama en absoluto (no hay ningún id todavía sobre el que construirla).
 
 ## Convenciones
 
@@ -226,8 +256,11 @@ python -m src.transcribe.run --video-id <id>
 python -m src.detect_cuts.run --video-id <id>
 python -m src.detect_chapters.run --video-id <id>
 python -m src.edit.run --video-id <id>
-python -m src.thumbnail.run --video-id <id>
-python -m src.publish.youtube --video-id <id> [--title "..."] [--privacy private|unlisted|public] [--execute]
+python -m src.subtitles.run --video-id <id>
+python -m src.thumbnail.run --video-id <id> [--num-candidates 5] [--min-gap-seconds 60]
+# elegir/editar un data/output/<id>/thumbnail_candidate_N.png a mano y guardarlo como
+# data/output/<id>/thumbnail.png antes de publicar
+python -m src.publish.youtube --video-id <id> [--title "..."] [--privacy private|unlisted|public] [--caption-language es] [--execute]
 ```
 
 ## Estado del proyecto

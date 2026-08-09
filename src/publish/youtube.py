@@ -10,10 +10,20 @@ la YouTube Data API v3 (videos().insert, subida resumable), adjuntando:
 - Descripción: el contenido de data/output/<video_id>/chapters.txt si
   existe (ya en el formato de capítulos listo para YouTube, ver
   detect_chapters/run.py), o vacía si no existe todavía.
-- Miniatura: data/output/<video_id>/thumbnail.png si existe, adjuntada
-  con thumbnails().set() DESPUÉS de que el vídeo se haya subido (hace
-  falta el video_id que devuelve YouTube, no el video_id interno del
-  proyecto).
+- Miniatura: data/output/<video_id>/thumbnail.png -- SIEMPRE obligatoria
+  (2026-08-09: ya no se genera automáticamente, el usuario la crea a mano
+  a partir de un frame candidato de src/thumbnail/run.py; ver
+  _thumbnail_path), adjuntada con thumbnails().set() DESPUÉS de que el
+  vídeo se haya subido (hace falta el video_id que devuelve YouTube, no
+  el video_id interno del proyecto). run() lanza FileNotFoundError con un
+  mensaje claro si no existe todavía, en vez de subir sin miniatura en
+  silencio.
+- Subtítulos: data/output/<video_id>/subtitles.srt si existe (ver
+  src/subtitles/run.py), adjuntada con captions().insert() DESPUÉS de que
+  el vídeo se haya subido -- mismo orden y misma razón que la miniatura
+  (hace falta el video_id de YouTube). Se sube como pista NO borrador
+  (isDraft=False) en el idioma de config/--caption-language (por defecto
+  "es", el proyecto es para directos en español).
 - privacy_status: SIEMPRE "private" por defecto -- nunca se sube como
   "public" ni "unlisted" salvo que se pida explícitamente por parámetro o
   con --privacy en el CLI.
@@ -34,7 +44,11 @@ snippet/status, MediaFileUpload resumable) y se detiene ahí SIN llamar a
 .execute() -- así se puede verificar que todo está bien construido sin
 gastar cuota de subida real ni crear un vídeo de verdad en el canal. Solo
 con execute=True (o --execute en el CLI) se ejecuta la subida real
-(vídeo + miniatura si existe).
+(vídeo + miniatura + subtítulos, cada uno si existe). Con execute=False
+NUNCA se llama a captions().insert() -- ni siquiera para construir la
+petición sin ejecutarla, a diferencia del vídeo -- porque hace falta el
+video_id que devuelve YouTube al insertar el vídeo, que solo existe tras
+una subida real.
 """
 from __future__ import annotations
 
@@ -61,6 +75,10 @@ _TOKEN_PATH = REPO_ROOT / "token.json"
 _DEFAULT_PRIVACY_STATUS = "private"
 _TITLE_PLACEHOLDER_PREFIX = "[TÍTULO PENDIENTE]"
 _DEFAULT_CATEGORY_ID = "20"  # "Gaming" en la taxonomía de categorías de vídeo de YouTube
+
+_DEFAULT_CAPTION_LANGUAGE = "es"
+_CAPTION_TRACK_NAME = "Español"
+_CAPTION_MIMETYPE = "application/octet-stream"  # tipo genérico aceptado por captions().insert() para .srt
 
 _UPLOAD_RETRIABLE_STATUS_CODES = (500, 502, 503, 504)
 _UPLOAD_MAX_RETRIES = 10
@@ -91,10 +109,50 @@ def _description_from_chapters(video_id: str, config: dict) -> str:
     return chapters_path.read_text(encoding="utf-8").strip()
 
 
-def _thumbnail_path(video_id: str, config: dict) -> Path | None:
-    """data/output/<video_id>/thumbnail.png si existe, o None (no bloquea la subida)."""
+def _thumbnail_path(video_id: str, config: dict) -> Path:
+    """
+    data/output/<video_id>/thumbnail.png -- SIEMPRE obligatoria para
+    publicar (2026-08-09: src/thumbnail/run.py ya no genera esta imagen
+    automáticamente, solo extrae frames candidatos; thumbnail.png lo crea
+    el usuario a mano a partir de uno de ellos, con el título/composición
+    que quiera, y lo guarda en esta misma ruta). Lanza FileNotFoundError
+    con un mensaje claro si no existe todavía -- mismo patrón que
+    _final_video_path -- en vez de subir sin miniatura en silencio o
+    fallar de forma confusa más adelante.
+    """
     path = _output_dir(video_id, config) / "thumbnail.png"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"thumbnail.png no encontrado, generar/elegir uno primero: no existe {path}. "
+            f"Ejecuta python -m src.thumbnail.run --video-id {video_id} para extraer frames candidatos "
+            f"(data/output/{video_id}/thumbnail_candidate_*.png), elige uno, edítalo si quieres, y "
+            f"guárdalo como {path} antes de publicar."
+        )
+    return path
+
+
+def _subtitles_path(video_id: str, config: dict) -> Path | None:
+    """data/output/<video_id>/subtitles.srt si existe (ver src/subtitles/run.py), o None (no bloquea la subida)."""
+    path = _output_dir(video_id, config) / "subtitles.srt"
     return path if path.exists() else None
+
+
+def _build_caption_body(youtube_video_id: str, language: str) -> dict:
+    """
+    Construye el `body` de captions().insert() -- función pura, sin red ni
+    credenciales, mismo patrón que _build_video_body. isDraft=False: la
+    pista queda publicada de inmediato, no como borrador pendiente de
+    revisión manual (coherente con "corte automático sin revisión manual"
+    de CLAUDE.md).
+    """
+    return {
+        "snippet": {
+            "videoId": youtube_video_id,
+            "language": language,
+            "name": _CAPTION_TRACK_NAME,
+            "isDraft": False,
+        }
+    }
 
 
 def _build_video_body(video_id: str, title: str | None, description: str, privacy_status: str) -> dict:
@@ -193,6 +251,7 @@ def run(
     title: str | None = None,
     execute: bool = False,
     youtube_service: Resource | None = None,
+    caption_language: str = _DEFAULT_CAPTION_LANGUAGE,
 ) -> dict:
     """
     Sube data/output/<video_id>/final.mp4 a YouTube.
@@ -202,8 +261,13 @@ def run(
     snippet/status, MediaFileUpload resumable -- pero NO llama a
     .execute() en ninguna parte: no se sube nada de verdad, no se gasta
     cuota, no se crea ningún vídeo en el canal. Solo con execute=True se
-    ejecuta la subida real (y, si hay miniatura, thumbnails().set()
-    justo después).
+    ejecuta la subida real (y, si hay miniatura/subtítulos,
+    thumbnails().set()/captions().insert() justo después -- en ese orden,
+    ambos necesitan el video_id que devuelve YouTube al subir el vídeo).
+    Con execute=False, captions().insert() no se llama ni se construye en
+    absoluto (a diferencia de videos().insert(), que sí se construye
+    siempre) -- no hay ningún video_id de YouTube todavía sobre el que
+    construir esa petición.
 
     `youtube_service` es inyectable (por defecto None, construye el
     servicio real vía OAuth con _build_youtube_service) -- mismo patrón
@@ -214,16 +278,20 @@ def run(
     Returns:
         dict con {"video_id", "youtube_video_id" (None si execute=False
         o si no se llegó a completar la subida), "title", "description",
-        "privacy_status", "thumbnail_attached": bool, "executed": bool}
+        "privacy_status", "thumbnail_attached": bool,
+        "subtitles_attached": bool, "executed": bool}
     """
     video_path = _final_video_path(video_id, config)
     description = _description_from_chapters(video_id, config)
     thumbnail_path = _thumbnail_path(video_id, config)
+    subtitles_path = _subtitles_path(video_id, config)
     body = _build_video_body(video_id, title, description, privacy_status)
 
     logger.info(
-        "Preparando subida de '%s' a YouTube: título=%r, privacidad=%s, miniatura=%s, ejecutar_subida_real=%s",
-        video_id, body["snippet"]["title"], privacy_status, thumbnail_path is not None, execute,
+        "Preparando subida de '%s' a YouTube: título=%r, privacidad=%s, miniatura=%s, subtítulos=%s, "
+        "ejecutar_subida_real=%s",
+        video_id, body["snippet"]["title"], privacy_status,
+        thumbnail_path, subtitles_path is not None, execute,
     )
 
     youtube = youtube_service if youtube_service is not None else _build_youtube_service(config)
@@ -236,7 +304,8 @@ def run(
         "title": body["snippet"]["title"],
         "description": description,
         "privacy_status": privacy_status,
-        "thumbnail_attached": thumbnail_path is not None,
+        "thumbnail_attached": True,
+        "subtitles_attached": False,
         "executed": False,
     }
 
@@ -255,12 +324,20 @@ def run(
     result["executed"] = True
     logger.info("Vídeo subido: https://youtu.be/%s", youtube_video_id)
 
-    if thumbnail_path is not None:
-        logger.info("Subiendo miniatura para %s...", youtube_video_id)
-        youtube.thumbnails().set(
-            videoId=youtube_video_id,
-            media_body=MediaFileUpload(str(thumbnail_path), mimetype="image/png"),
+    logger.info("Subiendo miniatura para %s...", youtube_video_id)
+    youtube.thumbnails().set(
+        videoId=youtube_video_id,
+        media_body=MediaFileUpload(str(thumbnail_path), mimetype="image/png"),
+    ).execute()
+
+    if subtitles_path is not None:
+        logger.info("Subiendo subtítulos (%s) para %s...", caption_language, youtube_video_id)
+        youtube.captions().insert(
+            part="snippet",
+            body=_build_caption_body(youtube_video_id, caption_language),
+            media_body=MediaFileUpload(str(subtitles_path), mimetype=_CAPTION_MIMETYPE),
         ).execute()
+        result["subtitles_attached"] = True
 
     return result
 
@@ -275,12 +352,20 @@ def _cli() -> None:
         action="store_true",
         help="Ejecuta la subida real. Sin esta flag solo se construye y verifica la petición, sin subir nada.",
     )
+    parser.add_argument(
+        "--caption-language",
+        default=_DEFAULT_CAPTION_LANGUAGE,
+        help="Idioma de la pista de subtítulos, si data/output/<video_id>/subtitles.srt existe (por defecto 'es').",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     config = load_config()
-    run(args.video_id, config, privacy_status=args.privacy, title=args.title, execute=args.execute)
+    run(
+        args.video_id, config, privacy_status=args.privacy, title=args.title, execute=args.execute,
+        caption_language=args.caption_language,
+    )
 
 
 if __name__ == "__main__":

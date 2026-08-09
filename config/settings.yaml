@@ -64,14 +64,19 @@ edit:
   append_outro: true
 
 thumbnail:
-  enabled: true                    # generar miniatura automáticamente; si es false, run() no hace nada (avisa en el log)
-  gemini_model: gemini-3.1-flash-image  # "Nano Banana": modelo intermedio (ni el más barato ni el más caro de la
-                                    # serie) usado SOLO para mejorar/estilizar la composición ya armada con Pillow
-                                    # a partir de frames reales -- nunca para generar la imagen desde cero
-  text_rendering: pillow           # "pillow" (quemar el texto con fuente/color/contorno controlados por nosotros)
-                                    # o "gemini" (dejar que Nano Banana lo añada al estilizar) -- ver
-                                    # src/thumbnail/run.py para la comparación entre ambos
-  face_candidate_segments: 3       # nº de tramos de habla larga (mismos config['edit']['long_speech_*']) de los
-                                    # que se muestrea un frame candidato de cara
-  gameplay_candidate_count: 24     # nº de puntos muestreados a lo largo de todo el vídeo para elegir el frame de
-                                    # gameplay con más movimiento fuera de facecam_region
+  enabled: true                    # extraer frames candidatos automáticamente; si es false, run() no hace nada (avisa en el log)
+  candidate_sample_count: 60       # nº de puntos muestreados por movimiento a lo largo del vídeo ANTES de quedarse
+                                    # con los --num-candidates de mayor puntuación separados por --min-gap-seconds
+                                    # (ver src/thumbnail/run.py); muestreo ligero (diferencia de píxeles, no optical
+                                    # flow), así que sigue siendo cosa de segundos
+
+subtitles:
+  enabled: true                    # generar subtitles.srt automáticamente; si es false, run() no hace nada (avisa en el log)
+  max_chars_per_line: 42           # estándar de la industria para contenido largo, estilo estático sin animación
+  max_lines: 2                     # máximo de líneas visibles por subtítulo
+  min_cue_seconds: 1.0             # tiempo mínimo en pantalla de un subtítulo
+  max_cue_seconds: 6.0             # tiempo máximo en pantalla de un subtítulo
+  reading_cps_min: 15              # ritmo de lectura de referencia (caracteres/segundo), banda 15-20; solo el
+  reading_cps_max: 20              # límite superior se aplica como suelo de duración, ver src/subtitles/run.py
+  natural_pause_gap_seconds: 0.5   # hueco entre palabras a partir del cual se considera una pausa natural donde
+                                    # es preferible cortar un subtítulo (además de puntuación de frase/cláusula)
