@@ -19,12 +19,12 @@ Además, INDEPENDIENTEMENTE de esas tres señales, recorta la intro del
 vídeo (desde el instante 0 hasta que el usuario aparece en pantalla) si
 config['detect_cuts']['trim_intro'] está activo (por defecto sí): ver
 detect_intro_face_cut, que detecta la primera aparición fiable de una cara
-dentro de config['facecam_region'] con un detector de caras ligero de
-OpenCV (cv2.FaceDetectorYN / "YuNet", ver el comentario junto a
-_INTRO_FACE_MODEL_PATH para por qué no es un Haar cascade clásico). Este
-corte NO pasa por el filtro de movimiento/silencio -- se aplica siempre
-que se detecte con fiabilidad una intro sin cara, haya o no haya audio o
-movimiento en ese tramo.
+dentro de config['facecam_region'] con el detector de caras ligero de
+src.common.face_detection (cv2.FaceDetectorYN / "YuNet", ver ese módulo
+para por qué no es un Haar cascade clásico). Este corte NO pasa por el
+filtro de movimiento/silencio -- se aplica siempre que se detecte con
+fiabilidad una intro sin cara, haya o no haya audio o movimiento en ese
+tramo.
 
 Guarda el resultado en data/cuts/<video_id>/cuts.json y loguea un resumen
 (nº de cortes, duración total eliminada) antes de que edit/ los aplique.
@@ -50,10 +50,34 @@ Fiabilidad del filtro de movimiento en grabaciones de 1-2h (progreso
 visible, checkpointing reanudable, y detección de cuelgues silenciosos de
 cv2.VideoCapture en Windows vía un watchdog con timeout): ver el docstring
 de compute_motion_timeseries.
+
+Exclusión de facecam_region del cálculo de movimiento (2026-08-09, idea
+tomada de auto-editor de WyattBlue, cuya detección de movimiento soporta
+restringir el análisis a una región del frame): sin esto, el propio
+streamer moviéndose en su webcam (gestos, risas, hablar) cuenta como
+"movimiento en pantalla" para score_motion_segment y puede evitar que se
+corte un silencio real donde no pasa nada en el contenido (el juego) --
+justo el caso contrario al que protege la regla de arriba ("silencio +
+acción visual NO se corta": la acción tiene que ser del contenido, no del
+propio streamer reaccionando en su recuadro). compute_motion_timeseries
+excluye facecam_region del área sobre la que se calcula la magnitud media
+de cada muestra (ver _build_motion_exclusion_mask) si
+config['detect_cuts']['exclude_facecam_from_motion'] está activo (por
+defecto sí); facecam_region está en píxeles del frame ORIGINAL y se
+reescala proporcionalmente a la resolución de análisis (480p) antes de
+aplicarse. Se excluye del promedio en vez de ponerse a cero manteniendo el
+mismo denominador, para no diluir la sensibilidad al movimiento real del
+resto del frame según lo grande que sea facecam_region. El checkpoint de
+movimiento visual guarda una huella de la máscara usada
+(_motion_mask_signature) y se invalida si no coincide con la de la
+ejecución actual, para no mezclar en una misma serie muestras calculadas
+con y sin exclusión si la config cambia entre una ejecución interrumpida y
+su reanudación.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -69,6 +93,7 @@ import numpy as np
 
 from src.common import db
 from src.common.config import REPO_ROOT, load_config
+from src.common.face_detection import facecam_crop_box, frame_has_face, load_face_detector
 
 logger = logging.getLogger(__name__)
 
@@ -125,27 +150,6 @@ _MOTION_STALL_TIMEOUT_SECONDS = 120.0
 # fijo como fallback (≈500 muestras * 0.3s ≈ 150s de vídeo entre
 # checkpoints).
 _MOTION_CHECKPOINT_FALLBACK_EVERY_SAMPLES = 500
-
-# detect_intro_face_cut: detector de caras ligero para el recorte de
-# facecam_region. La idea original era un Haar cascade clásico
-# (cv2.CascadeClassifier), pero la versión de OpenCV instalada en este
-# proyecto (5.0.x) eliminó ese binding de Python por completo (sin
-# CascadeClassifier ni ninguna constante CASCADE_*, confirmado en este
-# entorno). En su lugar se usa cv2.FaceDetectorYN ("YuNet"), el detector
-# de caras basado en DNN que sí trae esta versión de OpenCV: sigue siendo
-# ligero (modelo ONNX de ~230KB, milisegundos por frame sobre un recorte
-# pequeño) y, como el cascade, solo necesita analizar facecam_region, no
-# el frame completo -- nada de mediapipe ni nada más pesado.
-_INTRO_FACE_MODEL_FILENAME = "face_detection_yunet_2023mar.onnx"
-_INTRO_FACE_MODEL_PATH = REPO_ROOT / "assets" / "models" / _INTRO_FACE_MODEL_FILENAME
-
-# Parámetros de cv2.FaceDetectorYN.create; no son configurables hoy en
-# settings.yaml. Lo que sí lo es es CUÁNTAS muestras/qué ventana de
-# confirmación hacen falta para fiarse del resultado -- ver
-# detect_intro_face_cut.
-_INTRO_FACE_SCORE_THRESHOLD = 0.6
-_INTRO_FACE_NMS_THRESHOLD = 0.3
-_INTRO_FACE_TOP_K = 10  # solo hace falta saber si hay >=1 cara en un recorte pequeño, no las mejores 5000
 
 _WORD_CLEAN_RE = re.compile(r"[^\w]+", re.UNICODE)
 
@@ -264,6 +268,21 @@ def _motion_checkpoint_path(video_id: str, config: dict) -> Path:
     return (REPO_ROOT / config["paths"]["cuts"]).resolve() / video_id / "_motion_checkpoint.npz"
 
 
+def _motion_mask_signature(motion_mask: np.ndarray | None) -> str:
+    """
+    Huella de `motion_mask` para invalidar checkpoints calculados con una
+    máscara de exclusión de facecam_region distinta (o sin máscara, o con
+    otra región/config) -- ver _save_motion_checkpoint/_load_motion_checkpoint.
+    "none" si no hay máscara (se analiza el frame completo); si no, la
+    forma + hash del contenido, así que cualquier cambio en
+    facecam_region, en exclude_facecam_from_motion, o en la resolución de
+    análisis produce una huella distinta.
+    """
+    if motion_mask is None:
+        return "none"
+    return f"{motion_mask.shape[0]}x{motion_mask.shape[1]}:{hashlib.sha256(motion_mask.tobytes()).hexdigest()}"
+
+
 def _save_motion_checkpoint(
     checkpoint_path: Path,
     times: list[float],
@@ -271,6 +290,7 @@ def _save_motion_checkpoint(
     frame_idx: int,
     next_sample_frame: int,
     video_stat: os.stat_result,
+    motion_mask: np.ndarray | None,
 ) -> None:
     """
     Guarda el progreso parcial del cálculo de movimiento visual, para poder
@@ -291,15 +311,20 @@ def _save_motion_checkpoint(
         video_size=np.asarray(video_stat.st_size),
         sample_interval_seconds=np.asarray(_MOTION_SAMPLE_INTERVAL_SECONDS),
         analysis_height_px=np.asarray(_MOTION_ANALYSIS_HEIGHT_PX),
+        motion_mask_signature=np.asarray(_motion_mask_signature(motion_mask)),
     )
     os.replace(tmp_path, checkpoint_path)
 
 
-def _load_motion_checkpoint(checkpoint_path: Path, video_stat: os.stat_result) -> dict | None:
+def _load_motion_checkpoint(
+    checkpoint_path: Path, video_stat: os.stat_result, motion_mask: np.ndarray | None
+) -> dict | None:
     """
     Carga un checkpoint previo si existe y es válido para este vídeo (mismo
-    tamaño/mtime, mismo intervalo de muestreo). None si no hay checkpoint o
-    está obsoleto/corrupto, en cuyo caso se recalcula desde cero.
+    tamaño/mtime, mismo intervalo de muestreo, misma máscara de exclusión
+    de facecam_region -- ver _motion_mask_signature). None si no hay
+    checkpoint o está obsoleto/corrupto, en cuyo caso se recalcula desde
+    cero.
     """
     if not checkpoint_path.exists():
         return None
@@ -337,6 +362,20 @@ def _load_motion_checkpoint(checkpoint_path: Path, video_stat: os.stat_result) -
                     "distinta); se ignora y se recalcula desde cero."
                 )
                 return None
+            # "motion_mask_signature" no existía antes de excluir
+            # facecam_region del cálculo de movimiento; si falta, o no
+            # coincide con la máscara de ESTA ejecución (config o región
+            # cambiada, o exclude_facecam_from_motion activado/desactivado
+            # desde el checkpoint anterior), se descarta -- mezclar
+            # muestras calculadas con y sin exclusión en una misma serie
+            # sería silenciosamente inconsistente.
+            stored_signature = str(data["motion_mask_signature"]) if "motion_mask_signature" in data else None
+            if stored_signature != _motion_mask_signature(motion_mask):
+                logger.info(
+                    "Checkpoint de movimiento visual calculado con otra máscara de exclusión de "
+                    "facecam_region; se ignora y se recalcula desde cero."
+                )
+                return None
             return {
                 "times": list(data["times"]),
                 "magnitudes": list(data["magnitudes"]),
@@ -358,6 +397,7 @@ def _motion_worker(
     fps: float,
     analysis_size: tuple[int, int] | None,
     magnitude_scale_correction: float,
+    motion_mask: np.ndarray | None,
     out_queue: "queue.Queue",
     stop_event: threading.Event,
 ) -> None:
@@ -378,6 +418,16 @@ def _motion_worker(
     magnitud resultante se multiplica por magnitude_scale_correction
     (1/factor_de_escala) para que quede en unidades equivalentes a la
     resolución original y _MOTION_NORM_MAGNITUDE_PX no necesite cambiar.
+
+    motion_mask: máscara booleana del tamaño del frame de análisis (True =
+    incluir ese píxel), o None para analizar el frame completo -- ver
+    _build_motion_exclusion_mask. Si se da, la magnitud media de cada
+    muestra se calcula SOLO sobre los píxeles con mask=True, para que
+    excluir facecam_region no diluya la sensibilidad al movimiento real
+    del resto del frame (si en vez de esto se promediara sobre el frame
+    completo poniendo a cero los píxeles excluidos, un mismo movimiento en
+    la zona de contenido puntuaría más bajo cuanto más grande fuera
+    facecam_region, sin motivo).
     """
     try:
         # Backend FFMPEG explícito: usa libavcodec/libavformat directamente
@@ -423,7 +473,8 @@ def _motion_worker(
                     gray_a, gray_b, None, 0.5, 3, 15, 3, 5, 1.2, 0
                 )
                 magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-                mag_full_res_equiv = float(np.mean(magnitude)) * magnitude_scale_correction
+                mag_mean = float(np.mean(magnitude[motion_mask])) if motion_mask is not None else float(np.mean(magnitude))
+                mag_full_res_equiv = mag_mean * magnitude_scale_correction
 
                 next_sample_frame = idx_a + interval_frames
                 out_queue.put(("sample", (idx_a / fps, mag_full_res_equiv, frame_idx, next_sample_frame)))
@@ -497,19 +548,6 @@ def compute_motion_timeseries(video_id: str, config: dict) -> tuple[np.ndarray, 
     video_stat = input_path.stat()
     checkpoint_path = _motion_checkpoint_path(video_id, config)
 
-    resume = _load_motion_checkpoint(checkpoint_path, video_stat)
-    if resume:
-        times, magnitudes = resume["times"], resume["magnitudes"]
-        start_frame_idx, start_next_sample = resume["frame_idx"], resume["next_sample_frame"]
-        logger.info(
-            "Reanudando cálculo de movimiento visual desde checkpoint: %d muestra(s) ya calculada(s) "
-            "(hasta %.1fs de vídeo).",
-            len(times), times[-1] if times else 0.0,
-        )
-    else:
-        times, magnitudes = [], []
-        start_frame_idx, start_next_sample = 0, 0
-
     probe_cap = cv2.VideoCapture(str(input_path), cv2.CAP_FFMPEG)
     if not probe_cap.isOpened():
         probe_cap.release()
@@ -531,6 +569,35 @@ def compute_motion_timeseries(video_id: str, config: dict) -> tuple[np.ndarray, 
         magnitude_scale_correction = 1.0
         analysis_size = None
 
+    detect_cuts_config = config.get("detect_cuts", {})
+    motion_mask = None
+    if detect_cuts_config.get("exclude_facecam_from_motion", True):
+        analysis_w, analysis_h = analysis_size if analysis_size else (orig_width, orig_height)
+        motion_mask = _build_motion_exclusion_mask(
+            config.get("facecam_region"), orig_width, orig_height, analysis_w, analysis_h
+        )
+
+    # El checkpoint solo es válido para reanudar si, además de tratarse del
+    # mismo vídeo y el mismo muestreo/resolución de análisis (ver
+    # _load_motion_checkpoint), se calculó con la MISMA máscara de exclusión
+    # de facecam_region -- si no, mezclaría muestras antiguas (calculadas
+    # sobre el frame completo) con muestras nuevas (excluyendo la webcam) en
+    # una misma serie, silenciosamente inconsistente. Por eso el checkpoint
+    # se carga aquí, ya con motion_mask calculado, en vez de al principio de
+    # la función.
+    resume = _load_motion_checkpoint(checkpoint_path, video_stat, motion_mask)
+    if resume:
+        times, magnitudes = resume["times"], resume["magnitudes"]
+        start_frame_idx, start_next_sample = resume["frame_idx"], resume["next_sample_frame"]
+        logger.info(
+            "Reanudando cálculo de movimiento visual desde checkpoint: %d muestra(s) ya calculada(s) "
+            "(hasta %.1fs de vídeo).",
+            len(times), times[-1] if times else 0.0,
+        )
+    else:
+        times, magnitudes = [], []
+        start_frame_idx, start_next_sample = 0, 0
+
     interval_frames = max(1, round(_MOTION_SAMPLE_INTERVAL_SECONDS * fps))
     # CAP_PROP_FRAME_COUNT puede ser poco fiable según el contenedor; solo
     # se usa como estimación best-effort para el % de progreso y la
@@ -539,10 +606,11 @@ def compute_motion_timeseries(video_id: str, config: dict) -> tuple[np.ndarray, 
     checkpoint_every = max(1, expected_samples // 10) if expected_samples else _MOTION_CHECKPOINT_FALLBACK_EVERY_SAMPLES
 
     logger.info(
-        "Calculando serie de movimiento visual (optical flow, muestreo cada %.2fs, análisis a %s%s)...",
+        "Calculando serie de movimiento visual (optical flow, muestreo cada %.2fs, análisis a %s%s%s)...",
         _MOTION_SAMPLE_INTERVAL_SECONDS,
         f"{analysis_size[0]}x{analysis_size[1]}" if analysis_size else f"{orig_width}x{orig_height} (sin reescalar)",
         f", ~{expected_samples} muestra(s) esperada(s)" if expected_samples else "",
+        ", excluyendo facecam_region" if motion_mask is not None else "",
     )
 
     out_queue: "queue.Queue" = queue.Queue()
@@ -551,7 +619,7 @@ def compute_motion_timeseries(video_id: str, config: dict) -> tuple[np.ndarray, 
         target=_motion_worker,
         args=(
             str(input_path), start_frame_idx, start_next_sample, interval_frames, fps,
-            analysis_size, magnitude_scale_correction, out_queue, stop_event,
+            analysis_size, magnitude_scale_correction, motion_mask, out_queue, stop_event,
         ),
         daemon=True,
     )
@@ -597,7 +665,9 @@ def compute_motion_timeseries(video_id: str, config: dict) -> tuple[np.ndarray, 
                 ultimo_log = ahora
 
             if len(times) - checkpoint_baseline >= checkpoint_every:
-                _save_motion_checkpoint(checkpoint_path, times, magnitudes, frame_idx, next_sample_frame, video_stat)
+                _save_motion_checkpoint(
+                    checkpoint_path, times, magnitudes, frame_idx, next_sample_frame, video_stat, motion_mask
+                )
                 checkpoint_baseline = len(times)
                 logger.debug("Checkpoint de movimiento visual guardado (%d muestras).", len(times))
     finally:
@@ -661,59 +731,54 @@ def score_motion_segment(
     return float(min(1.0, peak_magnitude / _MOTION_NORM_MAGNITUDE_PX))
 
 
-def _load_face_detector(input_size: tuple[int, int]) -> "cv2.FaceDetectorYN":
+def _build_motion_exclusion_mask(
+    facecam_region: dict | None, orig_width: int, orig_height: int, analysis_width: int, analysis_height: int
+) -> np.ndarray | None:
     """
-    Crea el detector de caras YuNet (ver constantes _INTRO_FACE_* más
-    arriba para el porqué de YuNet en vez de un Haar cascade clásico)
-    sobre el modelo ONNX de assets/models/. No se cachea a nivel de
-    módulo: input_size depende de facecam_region, que puede variar de un
-    vídeo a otro, y crear el detector es barato (solo carga el modelo).
+    Máscara booleana (True = incluir ese píxel al calcular movimiento) del
+    tamaño del frame de ANÁLISIS (tras el reescalado a
+    _MOTION_ANALYSIS_HEIGHT_PX, ver compute_motion_timeseries), con
+    facecam_region excluida (False).
+
+    Por qué: sin esto, el propio streamer moviéndose en su webcam (gestos,
+    risas, hablar) cuenta como "movimiento en pantalla" y puede evitar que
+    se corte un silencio real donde no pasa nada en el contenido (el
+    juego/pantalla compartida) -- justo el caso contrario al que CLAUDE.md
+    protege ("silencio + acción visual NO se corta": la acción tiene que
+    ser del contenido, no del propio streamer reaccionando en su recuadro).
+
+    facecam_region está en píxeles del frame ORIGINAL (orig_width x
+    orig_height); se reescala proporcionalmente (mismo factor que el resto
+    del frame al pasar a analysis_width x analysis_height, preservando
+    aspect ratio) antes de aplicarla, reutilizando facecam_crop_box (de
+    src.common.face_detection) para el recorte/clamp a los límites del
+    frame de análisis.
+
+    Returns:
+        None si no hay facecam_region configurado, o si excluirla dejaría
+        la máscara vacía (facecam_region cubre el frame de análisis
+        entero -- caso límite de configuración; se prefiere analizar el
+        frame completo antes que no analizar nada).
     """
-    if not _INTRO_FACE_MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Falta el modelo de detección de caras ({_INTRO_FACE_MODEL_PATH}). "
-            "Sin él no se puede recortar la intro por detección de cara."
+    if not facecam_region or orig_height <= 0:
+        return None
+    scale = analysis_height / orig_height
+    scaled_region = {
+        "x": facecam_region.get("x", 0) * scale,
+        "y": facecam_region.get("y", 0) * scale,
+        "w": facecam_region.get("w", 0) * scale,
+        "h": facecam_region.get("h", 0) * scale,
+    }
+    x0, y0, x1, y1 = facecam_crop_box(scaled_region, analysis_width, analysis_height)
+    mask = np.ones((analysis_height, analysis_width), dtype=bool)
+    mask[y0:y1, x0:x1] = False
+    if not mask.any():
+        logger.warning(
+            "facecam_region cubre todo el frame de análisis; no se puede excluir del cálculo de "
+            "movimiento visual, se analiza el frame completo."
         )
-    return cv2.FaceDetectorYN.create(
-        str(_INTRO_FACE_MODEL_PATH), "", input_size,
-        score_threshold=_INTRO_FACE_SCORE_THRESHOLD,
-        nms_threshold=_INTRO_FACE_NMS_THRESHOLD,
-        top_k=_INTRO_FACE_TOP_K,
-    )
-
-
-def _facecam_crop_box(region: dict, frame_width: int, frame_height: int) -> tuple[int, int, int, int]:
-    """
-    Convierte facecam_region (x/y/w/h en px sobre el frame original) en
-    una caja de recorte (x0, y0, x1, y1) clampada a los límites reales del
-    frame -- config['facecam_region'] es una posición aproximada fijada a
-    mano, así que puede desbordar ligeramente si el vídeo de entrada
-    resulta tener otra resolución.
-    """
-    frame_width = max(1, frame_width)
-    frame_height = max(1, frame_height)
-    x0 = min(max(0, int(region.get("x", 0))), frame_width - 1)
-    y0 = min(max(0, int(region.get("y", 0))), frame_height - 1)
-    x1 = min(x0 + max(1, int(region.get("w", frame_width))), frame_width)
-    y1 = min(y0 + max(1, int(region.get("h", frame_height))), frame_height)
-    return x0, y0, x1, y1
-
-
-def _frame_has_face(
-    frame: np.ndarray, crop_box: tuple[int, int, int, int], face_detector: "cv2.FaceDetectorYN"
-) -> bool:
-    """
-    True si YuNet detecta al menos una cara dentro de crop_box. Solo
-    analiza ese recorte (no el frame completo): al ser una región pequeña
-    (el tamaño de la webcam), la inferencia es barata incluso muestreando
-    cientos de frames.
-    """
-    x0, y0, x1, y1 = crop_box
-    crop = frame[y0:y1, x0:x1]
-    if crop.size == 0:
-        return False
-    _, faces = face_detector.detect(crop)
-    return faces is not None and len(faces) > 0
+        return None
+    return mask
 
 
 def _confirm_window_at(
@@ -768,7 +833,7 @@ def _confirm_intro_end_time(
     return None
 
 
-def detect_intro_face_cut(video_id: str, config: dict, detector=_frame_has_face) -> dict | None:
+def detect_intro_face_cut(video_id: str, config: dict, detector=frame_has_face) -> dict | None:
     """
     Muestrea data/raw/<video_id>.mp4 cada
     config['detect_cuts']['intro_face_sample_interval_seconds'] desde el
@@ -776,8 +841,8 @@ def detect_intro_face_cut(video_id: str, config: dict, detector=_frame_has_face)
     muestreados, sin seeks -- misma razón de rendimiento que
     compute_motion_timeseries: un seek por muestra sería carísimo con un
     GOP largo), buscando la primera vez que hay una cara real dentro de
-    config['facecam_region'] (detector de caras ligero de OpenCV --
-    cv2.FaceDetectorYN, ver constantes _INTRO_FACE_* -- sobre el recorte
+    config['facecam_region'] (detector de caras ligero de
+    src.common.face_detection -- cv2.FaceDetectorYN -- sobre el recorte
     pequeño de esa región, no el frame completo).
 
     Para evitar falsos negativos puntuales (un parpadeo, un frame raro) no
@@ -796,7 +861,7 @@ def detect_intro_face_cut(video_id: str, config: dict, detector=_frame_has_face)
     el detector falla o el vídeo no tiene cara en facecam_region -- y se
     loguea un aviso claro.
 
-    `detector` es inyectable (por defecto _frame_has_face, el detector de
+    `detector` es inyectable (por defecto frame_has_face, el detector de
     caras real) para poder testear el resto de la lógica (muestreo
     secuencial, ventana de confirmación, límite de búsqueda) con un
     detector simulado, sin depender de que un modelo entrenado en caras
@@ -844,9 +909,9 @@ def detect_intro_face_cut(video_id: str, config: dict, detector=_frame_has_face)
             fps = 30.0
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        crop_box = _facecam_crop_box(facecam_region, frame_width, frame_height)
+        crop_box = facecam_crop_box(facecam_region, frame_width, frame_height)
         crop_size = (crop_box[2] - crop_box[0], crop_box[3] - crop_box[1])
-        face_detector = _load_face_detector(crop_size)
+        face_detector = load_face_detector(crop_size)
 
         interval_frames = max(1, round(sample_interval * fps))
         max_search_frames = round(max_search_seconds * fps)
@@ -929,6 +994,26 @@ def detect_filler_segments(video_id: str, transcript: dict, config: dict) -> lis
     return segments
 
 
+# Prioridad de `type` al fusionar cortes solapados (índice más bajo = gana
+# la fusión, ver _merge_overlapping_cuts): "intro" es una señal de corte
+# independiente de silencio+movimiento (ver detect_intro_face_cut) y vale
+# la pena poder distinguirla después en cuts.json, así que nunca debe
+# quedar enmascarada por un candidato de silencio/muletilla con el que
+# solape -- de lo contrario el instante del corte sigue siendo correcto,
+# pero se pierde la etiqueta que dice "esto es el recorte de intro". Entre
+# "filler" y "silence" se mantiene el criterio ya existente (silencio
+# domina) invertido a "filler domina", ya que una muletilla implica habla
+# real (no silencio de verdad) y es la señal más específica de las dos.
+_CUT_TYPE_PRIORITY = ["intro", "filler", "silence"]
+
+
+def _cut_type_rank(cut_type: str) -> int:
+    try:
+        return _CUT_TYPE_PRIORITY.index(cut_type)
+    except ValueError:
+        return len(_CUT_TYPE_PRIORITY)
+
+
 def _merge_overlapping_cuts(cuts: list[dict]) -> list[dict]:
     """Fusiona cortes solapados/contiguos tras aplicar el margen de seguridad."""
     if not cuts:
@@ -940,8 +1025,8 @@ def _merge_overlapping_cuts(cuts: list[dict]) -> list[dict]:
         last = merged[-1]
         if c["start"] <= last["end"]:
             last["end"] = max(last["end"], c["end"])
-            if c["type"] == "silence":
-                last["type"] = "silence"
+            if _cut_type_rank(c["type"]) < _cut_type_rank(last["type"]):
+                last["type"] = c["type"]
             reasons = last["reason"].split("; ")
             if c["reason"] not in reasons:
                 reasons.append(c["reason"])

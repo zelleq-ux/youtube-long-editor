@@ -25,6 +25,11 @@ detect_cuts:
                                   # candidato a su núcleo de silencio profundo, para no comerse una voz que
                                   # empieza floja y va subiendo de volumen hasta cruzar silence_db_threshold
   motion_threshold: 0.15         # por debajo de esto = "quietud visual" (0.0-1.0, mismo rango que newclips)
+  exclude_facecam_from_motion: true  # excluye facecam_region del cálculo de movimiento visual (idea tomada de
+                                      # auto-editor: restringir el análisis a una región del frame); si no, el
+                                      # propio streamer moviéndose en su webcam (gestos, risas) cuenta como
+                                      # "movimiento" y evita cortar un silencio real sin acción en el contenido.
+                                      # Desactivar para volver al comportamiento anterior (analizar el frame completo)
   filler_words: [eh, esto, o sea, bueno bueno]
   cut_margin_seconds: 0.2        # margen de seguridad que se deja sin cortar alrededor del tramo detectado
   trim_intro: true               # recorta automáticamente la intro (desde 0 hasta que aparece una cara
@@ -57,3 +62,16 @@ edit:
                                     # sin zoom (no da tiempo a completar la rampa)
   loudnorm: true
   append_outro: true
+
+thumbnail:
+  enabled: true                    # generar miniatura automáticamente; si es false, run() no hace nada (avisa en el log)
+  gemini_model: gemini-3.1-flash-image  # "Nano Banana": modelo intermedio (ni el más barato ni el más caro de la
+                                    # serie) usado SOLO para mejorar/estilizar la composición ya armada con Pillow
+                                    # a partir de frames reales -- nunca para generar la imagen desde cero
+  text_rendering: pillow           # "pillow" (quemar el texto con fuente/color/contorno controlados por nosotros)
+                                    # o "gemini" (dejar que Nano Banana lo añada al estilizar) -- ver
+                                    # src/thumbnail/run.py para la comparación entre ambos
+  face_candidate_segments: 3       # nº de tramos de habla larga (mismos config['edit']['long_speech_*']) de los
+                                    # que se muestrea un frame candidato de cara
+  gameplay_candidate_count: 24     # nº de puntos muestreados a lo largo de todo el vídeo para elegir el frame de
+                                    # gameplay con más movimiento fuera de facecam_region

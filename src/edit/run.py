@@ -241,6 +241,7 @@ from pathlib import Path
 
 from src.common import db
 from src.common.config import REPO_ROOT, load_config
+from src.common.timeline import compute_keep_segments, map_to_edited_timeline
 
 logger = logging.getLogger(__name__)
 
@@ -384,41 +385,6 @@ def _run_ffmpeg(cmd: list[str], *, description: str) -> None:
         raise RuntimeError(f"ffmpeg falló ({description}):\n{result.stderr[-4000:]}")
 
 
-def _compute_keep_segments(cuts: list[dict], duration: float) -> list[tuple[float, float]]:
-    """
-    Complemento de los tramos marcados en cuts.json dentro de [0, duration]:
-    los tramos que SÍ se conservan en el vídeo final, en orden.
-    """
-    keep: list[tuple[float, float]] = []
-    cursor = 0.0
-    for c in sorted(cuts, key=lambda c: c["start"]):
-        start = max(0.0, min(float(c["start"]), duration))
-        end = max(0.0, min(float(c["end"]), duration))
-        if start > cursor:
-            keep.append((cursor, start))
-        cursor = max(cursor, end)
-    if cursor < duration:
-        keep.append((cursor, duration))
-    return keep
-
-
-def _map_to_edited_timeline(t: float, sorted_cuts: list[dict]) -> float:
-    """
-    Convierte un timestamp del vídeo ORIGINAL a su equivalente en la línea
-    de tiempo YA CORTADA, restando la duración acumulada de los cortes
-    anteriores a t (o la porción de un corte que contenga a t) — el mismo
-    remapeo que CLAUDE.md documenta como necesario para detect_chapters.
-
-    `sorted_cuts` debe estar ordenado por "start".
-    """
-    removed = 0.0
-    for c in sorted_cuts:
-        if c["start"] >= t:
-            break
-        removed += min(float(c["end"]), t) - float(c["start"])
-    return max(0.0, t - removed)
-
-
 def detect_long_speech_segments(transcript: dict, cuts: list[dict], config: dict) -> list[dict]:
     """
     Agrupa palabras consecutivas de transcript['words'] cuyo hueco (gap)
@@ -462,8 +428,8 @@ def detect_long_speech_segments(transcript: dict, cuts: list[dict], config: dict
     for start, end in raw_runs:
         if end - start < min_seconds:
             continue
-        edited_start = _map_to_edited_timeline(start, sorted_cuts)
-        edited_end = _map_to_edited_timeline(end, sorted_cuts)
+        edited_start = map_to_edited_timeline(start, sorted_cuts)
+        edited_end = map_to_edited_timeline(end, sorted_cuts)
         if edited_end <= edited_start:
             continue
         long_runs.append({"start": edited_start, "end": edited_end})
@@ -947,7 +913,7 @@ def apply_cuts_with_zoom(video_id: str, cuts: list[dict], config: dict) -> str:
     info = _video_info(input_path)
     duration, width, height = info["duration"], info["width"], info["height"]
 
-    keep_segments = _compute_keep_segments(cuts, duration)
+    keep_segments = compute_keep_segments(cuts, duration)
     if not keep_segments:
         raise ValueError(
             f"Los cortes de '{video_id}' eliminan el vídeo entero (duración {duration:.2f}s); "

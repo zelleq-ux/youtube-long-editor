@@ -9,3 +9,5 @@ data/chapters/*
 data/output/*
 data/pipeline.db
 !data/**/.gitkeep
+client_secret.json
+token.json

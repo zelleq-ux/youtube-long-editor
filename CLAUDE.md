@@ -24,6 +24,8 @@ src/transcribe/       -> whisper -> transcripción con timestamps
 src/detect_cuts/      -> silencios de audio + movimiento visual + muletillas -> lista de cortes
 src/detect_chapters/  -> bloques temáticos de la transcripción -> capítulos con timestamp+título
 src/edit/             -> aplica cortes (+ micro-zoom), normaliza audio, añade outro
+src/thumbnail/        -> compone la miniatura de YouTube a partir de frames reales + Claude + Gemini
+src/publish/          -> sube el vídeo ya editado a YouTube (YouTube Data API v3)
 src/common/           -> config, db, utilidades compartidas con el otro proyecto (adaptar si hace falta)
 ```
 
@@ -35,6 +37,7 @@ src/common/           -> config, db, utilidades compartidas con el otro proyecto
 - `data/chapters/<video_id>/chapters.json` — `[{timestamp_s, title}]`
 - `data/output/<video_id>/final.mp4` — vídeo final editado
 - `data/output/<video_id>/chapters.txt` — capítulos en formato listo para pegar en YouTube (`00:00 Introducción`, etc.)
+- `data/output/<video_id>/thumbnail.png` — miniatura de YouTube (1280x720)
 
 ### Regla clave: silencio + acción visual NO se corta
 
@@ -47,6 +50,13 @@ src/common/           -> config, db, utilidades compartidas con el otro proyecto
 Un tramo solo se marca para corte si CUMPLE AMBAS condiciones. Silencio con
 alto movimiento visual (el usuario concentrado en una acción sin hablar) se
 conserva siempre. Ver `config['detect_cuts']['motion_threshold']`.
+
+El movimiento visual se mide EXCLUYENDO `facecam_region` del área
+analizada (`config['detect_cuts']['exclude_facecam_from_motion']`, por
+defecto activo): el propio streamer moviéndose en su webcam (gestos,
+risas) no cuenta como "acción en pantalla" — esa señal solo debe venir del
+contenido (el juego/pantalla compartida), nunca de la reacción del
+streamer en su recuadro.
 
 Las muletillas detectadas en la transcripción pasan por el mismo filtro de
 contexto visual antes de marcarse para corte.
@@ -128,6 +138,79 @@ remapean a la línea de tiempo ya cortada restando la duración acumulada de
 los cortes anteriores a cada punto — el mismo remapeo que hace falta para
 los capítulos, ver más abajo.
 
+### Miniatura de YouTube (thumbnail)
+
+`src/thumbnail/run.py` compone `data/output/<video_id>/thumbnail.png`
+(1280x720) SIEMPRE a partir de frames reales del vídeo, nunca inventando
+una imagen desde cero:
+
+1. Elige un frame real de `facecam_region` con expresión animada:
+   muestrea un par de puntos dentro de cada uno de los primeros
+   `config['thumbnail']['face_candidate_segments']` tramos de habla larga
+   (mismo criterio que el zoom hacia la webcam de arriba) y, de los
+   candidatos con una cara bien detectada (reutiliza el detector YuNet de
+   `src/common/face_detection.py`, el mismo que usa el recorte de intro),
+   elige el de mayor variación respecto al frame ~0.5s antes.
+2. Elige un frame real de la zona de juego (fuera de `facecam_region`) en
+   un momento de alto movimiento: muestrea
+   `config['thumbnail']['gameplay_candidate_count']` puntos por el vídeo
+   y se queda con el de mayor variación de píxeles, EXCLUYENDO
+   `facecam_region` del cálculo (misma idea que
+   `exclude_facecam_from_motion` de `detect_cuts`). Deliberadamente más
+   ligero que `compute_motion_timeseries` (diferencia de píxeles en vez
+   de optical flow denso, un puñado de candidatos en vez de recorrer el
+   vídeo entero) — generar una miniatura debe tardar segundos, no los
+   minutos que tarda el análisis de movimiento completo de `detect_cuts`.
+3. Analiza la transcripción completa con Claude
+   (`config['detect_chapters']['claude_model']`, mismo modelo/patrón de
+   structured outputs que `detect_chapters`) para encontrar el momento
+   más "punchy"/gancho del vídeo y proponer un titular corto (3-6
+   palabras).
+4. Compón ambos frames con Pillow (composición de imagen normal, sin
+   IA): gameplay a pantalla completa de fondo, panel de cara con borde en
+   una esquina, y el titular quemado encima con fuente/color/contorno
+   controlados por nosotros si `config['thumbnail']['text_rendering']` es
+   `"pillow"` (por defecto).
+5. Mejora de estilo (contraste, iluminación "profesional") con Gemini
+   ("Nano Banana", `config['thumbnail']['gemini_model']`, `GEMINI_API_KEY`
+   del `.env`) SOLO sobre la composición ya armada del paso anterior — el
+   prompt le pide explícitamente conservar la composición y el contenido
+   real, nunca generar una imagen nueva. Si `text_rendering` es
+   `"gemini"` en vez de `"pillow"`, el titular no se quema en el paso 4 y
+   se le pide a Gemini que lo añada aquí. Si la llamada falla, no
+   devuelve imagen, o `GEMINI_API_KEY` no está configurada, se cae de
+   vuelta a la composición de Pillow sin modificar en vez de fallar el
+   módulo entero — una miniatura sin mejorar sigue siendo mejor que
+   ninguna.
+
+`config['thumbnail']['enabled']` (por defecto true) desactiva el módulo
+entero sin tocar código: si es false, `run()` no hace nada y lo deja
+claro en el log.
+
+### Publicación en YouTube
+
+`src/publish/youtube.py` sube `data/output/<video_id>/final.mp4` a
+YouTube vía la YouTube Data API v3 (`videos().insert`, subida resumable),
+con título (por parámetro, o un placeholder marcado como pendiente si no
+se da ninguno), descripción (pega `chapters.txt` si existe) y miniatura
+(`thumbnail.png` si existe, vía `thumbnails().set()`, adjuntada después
+de que YouTube devuelva el id del vídeo subido). `privacy_status` es
+SIEMPRE `"private"` por defecto — nunca `"public"` ni `"unlisted"` salvo
+que se pida explícitamente.
+
+Autenticación OAuth estándar (`google-auth-oauthlib`,
+`YOUTUBE_CLIENT_SECRET_PATH` del `.env`): la primera vez abre el
+navegador para autorizar el acceso (scope `youtube.upload`) y guarda el
+token en `token.json` (raíz del repo, gitignored) para no repetir la
+autorización en cada ejecución.
+
+IMPORTANTE — salvaguarda estructural, no solo de proceso: `run()` no sube
+nada de verdad salvo que se pida `execute=True` explícito (`--execute` en
+el CLI); por defecto (`execute=False`) construye la petición completa
+(credenciales, body, `MediaFileUpload`) y se detiene ahí SIN llamar a
+`.execute()`, para poder verificar que todo está bien construido sin
+gastar cuota de subida real ni crear un vídeo de verdad en el canal.
+
 ## Convenciones
 
 Mismas que en `newclips-viral-pipeline`: Python 3.11+, type hints, función
@@ -143,6 +226,8 @@ python -m src.transcribe.run --video-id <id>
 python -m src.detect_cuts.run --video-id <id>
 python -m src.detect_chapters.run --video-id <id>
 python -m src.edit.run --video-id <id>
+python -m src.thumbnail.run --video-id <id>
+python -m src.publish.youtube --video-id <id> [--title "..."] [--privacy private|unlisted|public] [--execute]
 ```
 
 ## Estado del proyecto

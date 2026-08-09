@@ -16,5 +16,7 @@ def load_config(path: str | Path = REPO_ROOT / "config" / "settings.yaml") -> di
         config = yaml.safe_load(f)
     config["_env"] = {
         "anthropic_api_key": os.getenv("NEWCLIPS_ANTHROPIC_API_KEY"),
+        "gemini_api_key": os.getenv("GEMINI_API_KEY"),
+        "youtube_client_secret_path": os.getenv("YOUTUBE_CLIENT_SECRET_PATH"),
     }
     return config
