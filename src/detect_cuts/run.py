@@ -63,10 +63,11 @@ propio streamer reaccionando en su recuadro). compute_motion_timeseries
 excluye facecam_region del área sobre la que se calcula la magnitud media
 de cada muestra (ver _build_motion_exclusion_mask) si
 config['detect_cuts']['exclude_facecam_from_motion'] está activo (por
-defecto sí); facecam_region está en píxeles del frame ORIGINAL y se
-reescala proporcionalmente a la resolución de análisis (480p) antes de
-aplicarse. Se excluye del promedio en vez de ponerse a cero manteniendo el
-mismo denominador, para no diluir la sensibilidad al movimiento real del
+defecto sí); facecam_region es una fracción 0.0-1.0 del frame (ver
+src.common.face_detection, cambiado de píxeles absolutos el 2026-08-10
+para no depender de la resolución del vídeo) y se aplica directamente a la
+resolución de análisis (480p). Se excluye del promedio en vez de ponerse
+a cero manteniendo el mismo denominador, para no diluir la sensibilidad al movimiento real del
 resto del frame según lo grande que sea facecam_region. El checkpoint de
 movimiento visual guarda una huella de la máscara usada
 (_motion_mask_signature) y se invalida si no coincide con la de la
@@ -747,12 +748,12 @@ def _build_motion_exclusion_mask(
     protege ("silencio + acción visual NO se corta": la acción tiene que
     ser del contenido, no del propio streamer reaccionando en su recuadro).
 
-    facecam_region está en píxeles del frame ORIGINAL (orig_width x
-    orig_height); se reescala proporcionalmente (mismo factor que el resto
-    del frame al pasar a analysis_width x analysis_height, preservando
-    aspect ratio) antes de aplicarla, reutilizando facecam_crop_box (de
-    src.common.face_detection) para el recorte/clamp a los límites del
-    frame de análisis.
+    facecam_region es una fracción 0.0-1.0 del frame (ver
+    facecam_region_to_pixels/facecam_crop_box de src.common.face_detection),
+    así que es directamente aplicable a analysis_width x analysis_height
+    sin ningún reescalado manual -- independiente de orig_width/orig_height
+    (se mantienen como parámetros solo por compatibilidad de la firma con
+    el resto del módulo, no se usan aquí).
 
     Returns:
         None si no hay facecam_region configurado, o si excluirla dejaría
@@ -762,14 +763,7 @@ def _build_motion_exclusion_mask(
     """
     if not facecam_region or orig_height <= 0:
         return None
-    scale = analysis_height / orig_height
-    scaled_region = {
-        "x": facecam_region.get("x", 0) * scale,
-        "y": facecam_region.get("y", 0) * scale,
-        "w": facecam_region.get("w", 0) * scale,
-        "h": facecam_region.get("h", 0) * scale,
-    }
-    x0, y0, x1, y1 = facecam_crop_box(scaled_region, analysis_width, analysis_height)
+    x0, y0, x1, y1 = facecam_crop_box(facecam_region, analysis_width, analysis_height)
     mask = np.ones((analysis_height, analysis_width), dtype=bool)
     mask[y0:y1, x0:x1] = False
     if not mask.any():

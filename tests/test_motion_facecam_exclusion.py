@@ -72,9 +72,25 @@ WIDTH, HEIGHT = 420, 200
 FPS = 10.0
 N_FRAMES = 24
 
-FACECAM_REGION = {"x": 20, "y": 20, "w": 160, "h": 120}
-# Contenedor lejano, sin solape con FACECAM_REGION (gap de 40px en x).
-OUTSIDE_REGION = {"x": 220, "y": 20, "w": 160, "h": 120}
+# Contenedores en PÍXELES (para dibujar el vídeo sintético con _write_video,
+# que sigue trabajando en píxeles reales de este frame de WIDTH x HEIGHT).
+FACECAM_REGION_PX = {"x": 20, "y": 20, "w": 160, "h": 120}
+# Contenedor lejano, sin solape con FACECAM_REGION_PX (gap de 40px en x).
+OUTSIDE_REGION_PX = {"x": 220, "y": 20, "w": 160, "h": 120}
+
+
+def _to_fraction(region_px: dict) -> dict:
+    """Píxeles -> fracción 0.0-1.0 del frame (facecam_region ya no es en píxeles absolutos, ver src.common.face_detection)."""
+    return {
+        "x": region_px["x"] / WIDTH, "y": region_px["y"] / HEIGHT,
+        "w": region_px["w"] / WIDTH, "h": region_px["h"] / HEIGHT,
+    }
+
+
+# facecam_region (la que se pasa a compute_motion_timeseries vía config,
+# ver _score) es una fracción 0.0-1.0 del frame -- conversión exacta de
+# FACECAM_REGION_PX, para no cambiar el comportamiento verificado por este test.
+FACECAM_REGION = _to_fraction(FACECAM_REGION_PX)
 
 # El objeto ocupa la mayor parte de su contenedor pero con MARGIN de sobra
 # en todos los bordes (>= el winsize=15 que usa Farneback en este módulo):
@@ -156,8 +172,8 @@ def main() -> int:
             failures.append(f"{label}: {detail}")
 
     try:
-        _write_video(raw_dir / "motion_inside.mp4", FACECAM_REGION)
-        _write_video(raw_dir / "motion_outside.mp4", OUTSIDE_REGION)
+        _write_video(raw_dir / "motion_inside.mp4", FACECAM_REGION_PX)
+        _write_video(raw_dir / "motion_outside.mp4", OUTSIDE_REGION_PX)
 
         print("=== Caso 1: movimiento SOLO dentro de facecam_region ===")
         score_inside_excluded = _score("motion_inside", raw_dir, cuts_dir, exclude=True)

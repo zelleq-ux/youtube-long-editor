@@ -284,7 +284,10 @@ def main() -> int:
             "output": str(output_dir),
             "outro": str(work_dir / "no_outro.mp4"),  # no existe -> append_outro se omite
         },
-        "facecam_region": {"x": 15, "y": 60, "w": 200, "h": 120},
+        # Fracción 0.0-1.0 del frame (cambiado de píxeles absolutos el 2026-08-10,
+        # ver src.common.face_detection) -- conversión exacta de x=15,y=60,w=200,h=120
+        # sobre WIDTH=640,HEIGHT=360, para no cambiar el comportamiento de este test.
+        "facecam_region": {"x": 15 / WIDTH, "y": 60 / HEIGHT, "w": 200 / WIDTH, "h": 120 / HEIGHT},
         "edit": {
             "long_speech_min_seconds": 10,
             "long_speech_gap_seconds": 1.2,

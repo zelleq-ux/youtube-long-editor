@@ -36,7 +36,8 @@ src/common/           -> config, db, utilidades compartidas con el otro proyecto
 - `data/transcripts/<video_id>.json` — igual formato que en newclips-viral-pipeline: `{words: [...], segments: [...]}`
 - `data/cuts/<video_id>/cuts.json` — `[{start, end, type: "silence"|"filler", reason}]` — tramos A ELIMINAR
 - `data/chapters/<video_id>/chapters.json` — `[{timestamp_s, title}]`
-- `data/output/<video_id>/final.mp4` — vídeo final editado
+- `data/output/<video_id>/intro.mp4` — OPCIONAL, grabación de intro aparte (ver "Intro grabado aparte" más abajo); si no existe, el pipeline funciona exactamente igual que sin este archivo
+- `data/output/<video_id>/final.mp4` — vídeo final editado (intro + contenido editado + outro)
 - `data/output/<video_id>/chapters.txt` — capítulos en formato listo para pegar en YouTube (`00:00 Introducción`, etc.)
 - `data/output/<video_id>/subtitles.srt` — subtítulos del vídeo ya editado, formato .srt estándar
 - `data/output/<video_id>/thumbnail_candidate_<N>.png` — frames candidatos a miniatura (resolución completa, sin componer) que genera `src/thumbnail/run.py`
@@ -127,9 +128,11 @@ zoom sube lento y suave (curva coseno, sin saltos) desde 1.0 hasta
 `edit.long_speech_zoom_factor` (por defecto ~1.12-1.15) durante los
 primeros `edit.zoom_in_duration_seconds` (por defecto 4.5s) del tramo,
 dirigido hacia `facecam_region` (posición aproximada x/y/w/h de la webcam
-sobre el frame original, en la raíz de la config — compartida con el
-recorte de intro de `detect_cuts` — no hace falta encuadrar la cara con
-precisión, solo que el zoom se sienta dirigido hacia ahí). CORTA SECO a
+como FRACCIÓN 0.0-1.0 del frame original — no píxeles absolutos, así
+funciona igual sin importar la resolución del vídeo — en la raíz de la
+config, compartida con el recorte de intro de `detect_cuts`; no hace
+falta encuadrar la cara con precisión, solo que el zoom se sienta
+dirigido hacia ahí). CORTA SECO a
 1.0 (salto instantáneo, no una transición) exactamente en el instante en
 que se completa la rampa (inicio_del_tramo + zoom_in_duration_seconds) —
 NO se mantiene sostenido el resto del tramo de habla, ni el corte espera a
@@ -173,6 +176,61 @@ cuántos cortes la preceden. Por eso `subtitles/` debe ejecutarse DESPUÉS
 de `edit/` en el pipeline (ver "Comandos útiles") -- sin `final.mp4`
 todavía, o si la deriva medida es implausible, se cae de vuelta al
 remapeo sin calibrar en vez de fallar.
+
+### Intro grabado aparte
+
+El usuario puede grabar un intro (1-2 min explicando de qué trata el
+vídeo) en una sesión de OBS APARTE, normalmente unos minutos después del
+directo — no es parte de la grabación principal. Si guarda ese archivo
+como `data/output/<video_id>/intro.mp4`, `edit/` lo antepone al PRINCIPIO
+del vídeo final (antes incluso del primer segundo del contenido ya
+cortado/con zoom/normalizado) y el outro sigue exactamente donde ya
+estaba, al final: `final.mp4` = intro + contenido editado + outro. Es
+completamente OPCIONAL — sin ese archivo, el pipeline se comporta
+exactamente igual que si esta funcionalidad no existiera
+(`config['edit']['prepend_intro']`, por defecto true, permite además
+desactivarlo sin borrar el archivo).
+
+El intro NO pasa por `detect_cuts` ni por el zoom hacia la webcam: se usa
+completo, tal cual lo grabó el usuario. Como puede venir de una sesión de
+OBS distinta, puede tener resolución/fps/audio diferentes a
+`data/raw/<video_id>.mp4` — nunca se asume que coinciden. `edit/` decide
+automáticamente cuánto hace falta convertir para poder unirlo (mismo
+mecanismo de tres niveles ya usado para el outro, generalizado para poder
+anteponer Y posponer clips — ver `src/edit/run.py`, `_glue_extra_clip`):
+si los parámetros de vídeo Y audio coinciden, concatenación directa sin
+recodificar nada; si solo difiere el audio, se recodifica únicamente el
+audio del intro; si difiere la resolución/fps, se recodifica el intro
+completo. En todos los casos se escala/adapta SIEMPRE el intro a la
+resolución del contenido PRINCIPAL, nunca al revés — el intro es una
+grabación corta, perder algo de calidad ahí es aceptable; el contenido
+principal del stream no.
+
+Capítulos y subtítulos se ajustan para seguir cayendo en el punto
+correcto del vídeo ya con el intro delante:
+
+- `detect_chapters` antepone siempre un capítulo fijo "Introducción" en
+  0:00 representando el intro (en vez del capítulo genérico condicional
+  de antes) y desplaza todos los capítulos ya detectados por la duración
+  del intro (leída con ffprobe directamente de `intro.mp4` — nominal, sin
+  calibrar contra el vídeo final, porque este módulo puede correr antes
+  que `edit/`).
+- `subtitles` transcribe el intro por separado (mismo núcleo de
+  faster-whisper que la etapa de transcripción principal, sin persistir
+  el resultado a disco — un clip de 1-2 min se retranscribe en segundos)
+  y antepone sus propias palabras al `.srt` con timestamps 0-based; las
+  palabras del contenido principal se desplazan por la duración del intro
+  ANCLADA a la duración real de `final.mp4` (la misma calibración de
+  deriva ya documentada arriba para los cortes: `compute_drift_per_cut`
+  resta la duración del intro de `final.mp4` exactamente igual que ya
+  resta la del outro, así que cualquier imprecisión en esa duración se
+  absorbe en la misma corrección lineal en vez de quedar como un
+  desplazamiento fijo sin corregir).
+
+`thumbnail` sigue extrayendo candidatos SOLO de `data/raw/<video_id>.mp4`
+(el contenido principal del stream) — el intro nunca toca ese archivo, así
+que queda excluido de los candidatos por construcción, sin necesidad de
+ningún filtro adicional (igual que ya se ignora el outro).
 
 ### Miniatura de YouTube (thumbnail)
 
@@ -255,6 +313,9 @@ python -m src.ingest.run --file <ruta_al_mp4_de_obs>
 python -m src.transcribe.run --video-id <id>
 python -m src.detect_cuts.run --video-id <id>
 python -m src.detect_chapters.run --video-id <id>
+# opcional: guardar un intro grabado aparte como data/output/<id>/intro.mp4
+# antes de este paso -- edit/ lo antepone al vídeo final si existe (ver CLAUDE.md
+# "Intro grabado aparte"); si no existe, este paso no cambia nada
 python -m src.edit.run --video-id <id>
 python -m src.subtitles.run --video-id <id>
 python -m src.thumbnail.run --video-id <id> [--num-candidates 5] [--min-gap-seconds 60]

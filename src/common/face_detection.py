@@ -57,20 +57,61 @@ def load_face_detector(input_size: tuple[int, int]) -> "cv2.FaceDetectorYN":
     )
 
 
-def facecam_crop_box(region: dict, frame_width: int, frame_height: int) -> tuple[int, int, int, int]:
+def facecam_region_to_pixels(region: dict, frame_width: int, frame_height: int) -> dict:
     """
-    Convierte una región (x/y/w/h en px sobre el frame original, p.ej.
-    config['facecam_region']) en una caja de recorte (x0, y0, x1, y1)
-    clampada a los límites reales del frame -- la región es una posición
-    aproximada fijada a mano, así que puede desbordar ligeramente si el
-    vídeo de entrada resulta tener otra resolución.
+    Convierte una región (x/y/w/h como FRACCIÓN 0.0-1.0 del frame, p.ej.
+    config['facecam_region']) a píxeles absolutos para un frame concreto de
+    frame_width x frame_height.
+
+    Cambiado de píxeles absolutos a fracción (2026-08-10): la región se
+    fijaba a mano en píxeles sobre un frame de referencia (1920x1080, el de
+    dinoblade_1/icarus_1) y se aplicaba tal cual sin importar la resolución
+    real del vídeo procesado -- correcto mientras todos los vídeos
+    compartieran esa resolución, pero descalibrado sin avisar en cuanto
+    apareció una grabación a otra resolución (shift_at_midnight_1,
+    2560x1440: la webcam quedaba en una posición completamente distinta si
+    se interpretaban esos mismos píxeles literalmente). Con fracción del
+    frame, la misma config sirve para cualquier resolución sin recalibrar,
+    asumiendo que la posición/tamaño de la webcam en OBS se mantiene
+    proporcional al canvas entre grabaciones.
+
+    Por defecto (claves ausentes) x=0.0, y=0.0, w=1.0, h=1.0 -- el frame
+    completo, igual que el default anterior en píxeles (x=0, y=0,
+    w=frame_width, h=frame_height).
+
+    Se usa round() (no truncado) al convertir a píxeles: para una región
+    calibrada y su vídeo de referencia exactos, evita que el redondeo de
+    punto flotante de la división origen->fracción se pierda un píxel de
+    más al truncar en la conversión de vuelta (fracción->píxel) -- p.ej.
+    400/1080 no es exactamente representable en binario, pero
+    round(1080 * (400/1080)) sigue dando 400, mientras que int(...) podría
+    dar 399 según el redondeo exacto del float intermedio.
     """
     frame_width = max(1, frame_width)
     frame_height = max(1, frame_height)
-    x0 = min(max(0, int(region.get("x", 0))), frame_width - 1)
-    y0 = min(max(0, int(region.get("y", 0))), frame_height - 1)
-    x1 = min(x0 + max(1, int(region.get("w", frame_width))), frame_width)
-    y1 = min(y0 + max(1, int(region.get("h", frame_height))), frame_height)
+    return {
+        "x": round(float(region.get("x", 0.0)) * frame_width),
+        "y": round(float(region.get("y", 0.0)) * frame_height),
+        "w": round(float(region.get("w", 1.0)) * frame_width),
+        "h": round(float(region.get("h", 1.0)) * frame_height),
+    }
+
+
+def facecam_crop_box(region: dict, frame_width: int, frame_height: int) -> tuple[int, int, int, int]:
+    """
+    Convierte una región (x/y/w/h como fracción 0.0-1.0 del frame, p.ej.
+    config['facecam_region'] -- ver facecam_region_to_pixels) en una caja de
+    recorte (x0, y0, x1, y1) en píxeles, clampada a los límites reales del
+    frame -- la región es una posición aproximada fijada a mano, así que
+    puede desbordar ligeramente por redondeo incluso ya convertida.
+    """
+    frame_width = max(1, frame_width)
+    frame_height = max(1, frame_height)
+    px = facecam_region_to_pixels(region, frame_width, frame_height)
+    x0 = min(max(0, px["x"]), frame_width - 1)
+    y0 = min(max(0, px["y"]), frame_height - 1)
+    x1 = min(x0 + max(1, px["w"]), frame_width)
+    y1 = min(y0 + max(1, px["h"]), frame_height)
     return x0, y0, x1, y1
 
 
