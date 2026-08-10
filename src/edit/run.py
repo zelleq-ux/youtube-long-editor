@@ -23,15 +23,76 @@ data/raw/<video_id>.mp4:
    a completar la rampa, así que no se aplica zoom en absoluto en ese
    tramo. NO hay zoom en los puntos de corte en sí.
 3. Normaliza el audio con ffmpeg loudnorm si config['edit']['loudnorm'].
-4. Si config['edit']['append_outro'], concatena assets/outro/outro.mp4 al
+4. Si config['edit']['prepend_intro'], antepone
+   data/output/<video_id>/intro.mp4 al PRINCIPIO (antes incluso del primer
+   segundo del contenido ya editado) -- ver "Intro grabado aparte" más
+   abajo.
+5. Si config['edit']['append_outro'], concatena assets/outro/outro.mp4 al
    final.
 
-Guarda en data/output/<video_id>/final.mp4.
+Guarda en data/output/<video_id>/final.mp4 (orden final: intro + contenido
+editado + outro).
 
 Nota de orden: si detect_chapters ya generó timestamps sobre el vídeo
 editado, este módulo debe correr ANTES de detect_chapters, o
 detect_chapters debe recalcular sus timestamps a partir de los cortes
 aplicados aquí — mantener consistencia, ver CLAUDE.md.
+
+Intro grabado aparte (2026-08-10, simétrico al outro): a diferencia del
+resto del contenido, data/output/<video_id>/intro.mp4 (opcional) es una
+grabación de OBS APARTE, normalmente hecha 1-2 min después del directo en
+otra sesión -- puede tener resolución/fps/audio distintos a
+data/raw/<video_id>.mp4, así que NO se asume que coincidan (ver
+prepend_intro/_glue_extra_clip). Ni el corte de cuts.json ni el zoom hacia
+la webcam se aplican al intro (se usa tal cual, completo); solo se ajusta
+lo mínimo necesario para poder unirlo al contenido principal sin
+recodificar de más -- ver "Unión de clips extra (intro/outro)" más abajo.
+
+Unión de clips extra (intro/outro), tres niveles (2026-08-10, generalizado
+a partir del append_outro original para poder anteponer Y posponer clips
+-- misma lógica de detección/conversión validada primero de forma manual
+en data/work/shift_at_midnight_1/run_pipeline.py, función _smart_concat,
+contra un caso real con audio distinto pero mismo vídeo):
+
+_glue_extra_clip(main_path, extra_path, position, ...) une un "clip extra"
+(intro o outro) con el clip PRINCIPAL, que NUNCA se recodifica sea cual
+sea `position` ("before" o "after") -- puede ser la grabación de horas
+del stream (o ya llevar el otro extremo pegado), así que es la que nunca
+debe perder calidad recodificándola de más. Tres niveles, del más barato
+al más caro (mismo criterio que _same_stream_params original, pero con un
+nivel intermedio nuevo):
+
+1. Parámetros de vídeo Y audio idénticos -> concatenación directa sin
+   recodificar nada (concat demuxer, -c copy) -- si esto falla pese a
+   coincidir los parámetros (el concat demuxer con -c copy NO valida esto
+   por su cuenta, ver más abajo), se recae directamente en el nivel 3.
+2. Solo el AUDIO difiere (vídeo idéntico) -> se recodifica ÚNICAMENTE el
+   audio del clip extra, vídeo copiado sin tocar -- caso nuevo respecto al
+   append_outro original (que antes recodificaba vídeo+audio aunque solo
+   el audio difiriera), tomado de _smart_concat.
+3. El vídeo difiere (resolución y/o fps) -> se recodifica el clip extra
+   COMPLETO (vídeo+audio), escalado/rellenado a la resolución y fps del
+   clip PRINCIPAL -- SIEMPRE se adapta el clip extra al principal, nunca al
+   revés, para no degradar la calidad del contenido principal del stream
+   (intro/outro son grabaciones cortas, perder algo de calidad ahí es
+   aceptable; el contenido principal no).
+
+IMPORTANTE (heredado del append_outro original): el concat demuxer con
+-c copy NO valida que los streams encajen por su cuenta -- si no coinciden
+y se le pide igualmente, no falla con un código de error, produce un
+archivo "correcto" pero corrupto (fps/duración con valores absurdos). Por
+eso _glue_extra_clip comprueba los parámetros explícitamente ANTES de
+elegir la vía rápida, en vez de intentarla siempre y fiarse del
+returncode.
+
+Por qué solo el clip extra pasa nunca por un filtro `concat` de ffmpeg (y
+el principal nunca se recodifica en absoluto): ver "Fuga de frames de
+vídeo en el filtro concat de ffmpeg" más abajo -- el mismo bug ya
+documentado para el paso de corte se reprodujo en 2026-08-09 contra
+`dinoblade_1` real en el append_outro original al pasar el clip principal
+COMPLETO por un filtro `concat` junto con el outro; el fix (evitar el
+filtro `concat` del todo, no acotarlo) se generaliza aquí a los tres
+niveles.
 
 Los tramos de habla continua se identifican sobre los timestamps del
 transcript, que son del vídeo ORIGINAL (antes de cortar). Como el zoom se
@@ -241,6 +302,7 @@ from pathlib import Path
 
 from src.common import db
 from src.common.config import REPO_ROOT, load_config
+from src.common.face_detection import facecam_region_to_pixels
 from src.common.timeline import compute_keep_segments, map_to_edited_timeline
 
 logger = logging.getLogger(__name__)
@@ -832,9 +894,14 @@ def _apply_zoom(cut_path: Path, speech_segments: list[dict], config: dict, width
     edit_config = config.get("edit", {})
     zoom_factor = float(edit_config.get("long_speech_zoom_factor", 1.0))
     ramp_seconds = float(edit_config.get("zoom_in_duration_seconds", 4.5))
-    facecam = config.get("facecam_region") or {}
-    focus_x = float(facecam.get("x", 0)) + float(facecam.get("w", width)) / 2
-    focus_y = float(facecam.get("y", 0)) + float(facecam.get("h", height)) / 2
+    # facecam_region es una fracción 0.0-1.0 del frame (ver
+    # src.common.face_detection, cambiado de píxeles absolutos el
+    # 2026-08-10 para no depender de la resolución del vídeo); se convierte
+    # aquí a píxeles de ESTE clip concreto (width x height, el del vídeo ya
+    # cortado) antes de calcular el punto de enfoque del zoom.
+    facecam_px = facecam_region_to_pixels(config.get("facecam_region") or {}, width, height)
+    focus_x = facecam_px["x"] + facecam_px["w"] / 2
+    focus_y = facecam_px["y"] + facecam_px["h"] / 2
 
     result_path = cut_path.with_name("_cuts_zoom.mp4")
     passes = _plan_zoom_passes(speech_segments, zoom_factor, ramp_seconds, focus_x, focus_y, width, height)
@@ -1011,40 +1078,185 @@ def normalize_audio(clip_path: str, config: dict) -> str:
     return output_path
 
 
-def _same_stream_params(clip_info: dict, outro_info: dict) -> bool:
-    """
-    True si clip_info y outro_info son lo bastante parecidos como para
-    concatenar con el concat demuxer (-c copy) sin recodificar.
+def _same_video_params(a: dict, b: dict) -> bool:
+    return a["width"] == b["width"] and a["height"] == b["height"] and abs(a["fps"] - b["fps"]) <= 0.01
 
-    IMPORTANTE: el concat demuxer con -c copy NO valida esto por su cuenta
-    — si los streams no encajan, no falla con un código de error, produce
-    un archivo "correcto" pero corrupto (fps/duración con valores absurdos,
-    p.ej. un frame rate mezcla de los dos vídeos). Por eso aquí se
-    comprueba explícitamente ANTES de elegir la vía rápida, en vez de
-    intentarla y fiarse del returncode de ffmpeg.
+
+def _same_audio_params(a: dict, b: dict) -> bool:
+    return a["sample_rate"] == b["sample_rate"] and a["channels"] == b["channels"]
+
+
+def _write_concat_list(list_path: Path, paths: list[Path]) -> None:
+    lines = [f"file '{Path(p).resolve().as_posix()}'" for p in paths]
+    list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _glue_with_faststart(paths: list[Path], out_path: Path, description: str) -> None:
     """
-    if clip_info["width"] != outro_info["width"] or clip_info["height"] != outro_info["height"]:
-        return False
-    if abs(clip_info["fps"] - outro_info["fps"]) > 0.01:
-        return False
-    if clip_info["sample_rate"] != outro_info["sample_rate"]:
-        return False
-    if clip_info["channels"] != outro_info["channels"]:
-        return False
-    return True
+    Como _glue_video_files (concat DEMUXER, -c copy, nunca el filtro
+    `concat`) pero además con -movflags +faststart en la salida (moov al
+    principio del archivo) -- a diferencia de _glue_video_files (usado
+    para pegar shards/tramos INTERMEDIOS del corte, que se van a seguir
+    procesando), aquí la salida puede acabar siendo directamente el
+    final.mp4 entregado al usuario, así que interesa moov al principio
+    desde ya.
+    """
+    list_path = out_path.with_suffix(".txt")
+    _write_concat_list(list_path, paths)
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+        "-c", "copy", "-movflags", "+faststart",
+        str(out_path),
+    ]
+    _run_ffmpeg(cmd, description=description)
+    list_path.unlink(missing_ok=True)
+
+
+def _ordered_for_position(main_path: Path, extra_path: Path, position: str) -> list[Path]:
+    if position == "before":
+        return [extra_path, main_path]
+    if position == "after":
+        return [main_path, extra_path]
+    raise ValueError(f"position debe ser 'before' o 'after', no {position!r}")
+
+
+def _match_audio_only(extra_path: Path, main_info: dict, out_path: Path, description: str) -> None:
+    """Recodifica SOLO el audio de extra_path para que encaje con main_info -- vídeo copiado (-c:v copy), sin recodificar."""
+    channels = main_info["channels"] or 2
+    channel_layout = "stereo" if channels >= 2 else "mono"
+    cmd = [
+        "ffmpeg", "-y", "-i", str(extra_path),
+        "-c:v", "copy",
+        "-af", f"aformat=sample_rates={main_info['sample_rate']}:channel_layouts={channel_layout}",
+        "-c:a", "aac", "-ar", str(main_info["sample_rate"]), "-ac", str(channels), "-b:a", "192k",
+        str(out_path),
+    ]
+    _run_ffmpeg(cmd, description=description)
+
+
+def _match_full(extra_path: Path, main_info: dict, out_path: Path, description: str) -> None:
+    """
+    Recodifica vídeo+audio de extra_path para que encaje con main_info
+    (resolución/fps/sample_rate/canales) -- SIEMPRE se escala el clip
+    EXTRA (intro u outro) a los parámetros del clip PRINCIPAL, nunca al
+    revés (ver "Unión de clips extra" en el docstring del módulo).
+    """
+    width, height, fps = main_info["width"], main_info["height"], main_info["fps"]
+    sample_rate = main_info["sample_rate"] or 48000
+    channels = main_info["channels"] or 2
+    channel_layout = "stereo" if channels >= 2 else "mono"
+    cmd = [
+        "ffmpeg", "-y", "-i", str(extra_path),
+        "-vf",
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}",
+        "-af", f"aformat=sample_rates={sample_rate}:channel_layouts={channel_layout}",
+        "-c:v", "libx264", "-crf", "20", "-preset", "medium", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-ar", str(sample_rate), "-ac", str(channels), "-b:a", "192k",
+        str(out_path),
+    ]
+    _run_ffmpeg(cmd, description=description)
+
+
+def _glue_via_full_recode(
+    main_path: Path, main_info: dict, extra_path: Path, position: str, out_path: Path, extra_label: str,
+) -> tuple[Path, float]:
+    matched_path = out_path.with_name(f"_{extra_label}_full_matched.mp4")
+    _match_full(
+        extra_path, main_info, matched_path,
+        description=f"Normalizando el {extra_label} a los parámetros del clip principal",
+    )
+    duration = _video_info(matched_path)["duration"]
+    _glue_with_faststart(
+        _ordered_for_position(main_path, matched_path, position), out_path,
+        description=f"Uniendo el clip principal con el {extra_label} ya normalizado",
+    )
+    matched_path.unlink(missing_ok=True)
+    return out_path, duration
+
+
+def _glue_extra_clip(
+    main_path: Path, extra_path: Path, position: str, out_path: Path, extra_label: str,
+) -> tuple[Path, float]:
+    """
+    Une extra_path (intro o outro) con main_path (el clip principal, que
+    NUNCA se recodifica sea cual sea `position`) -- ver "Unión de clips
+    extra (intro/outro), tres niveles" en el docstring del módulo para el
+    detalle completo de los tres niveles y su motivación.
+
+    Args:
+        position: "before" (antepone extra_path, p.ej. intro) o "after"
+            (lo pospone, p.ej. outro).
+        extra_label: nombre corto para logs/nombres de archivo intermedio
+            ("intro"/"outro").
+
+    Returns:
+        (out_path, duración en segundos de extra_path tal y como queda
+        incorporada -- la del propio archivo si se usó la vía rápida, o la
+        del archivo ya recodificado si no).
+    """
+    main_info = _video_info(main_path)
+    extra_info = _video_info(extra_path)
+    video_matches = _same_video_params(main_info, extra_info)
+    audio_matches = _same_audio_params(main_info, extra_info)
+
+    if video_matches and audio_matches:
+        logger.info(
+            "Añadiendo %s (concatenación rápida sin recodificar; mismos parámetros de stream)...",
+            extra_label,
+        )
+        list_path = out_path.with_name(f"_{extra_label}_concat_list.txt")
+        _write_concat_list(list_path, _ordered_for_position(main_path, extra_path, position))
+        fast_cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+            "-c", "copy", "-movflags", "+faststart", str(out_path),
+        ]
+        result = subprocess.run(fast_cmd, capture_output=True, text=True)
+        list_path.unlink(missing_ok=True)
+        if result.returncode == 0:
+            return out_path, extra_info["duration"]
+        logger.warning(
+            "La concatenación rápida del %s falló pese a tener los mismos parámetros de stream; "
+            "recodificando el %s por completo para unirlo:\n%s",
+            extra_label, extra_label, result.stderr[-1000:],
+        )
+        return _glue_via_full_recode(main_path, main_info, extra_path, position, out_path, extra_label)
+
+    if video_matches:  # solo difiere el audio -- caso nuevo respecto al append_outro original, ver _smart_concat
+        logger.info(
+            "El %s solo difiere en audio del clip principal (principal=%sHz/%sch, %s=%sHz/%sch); "
+            "ajustando SOLO el audio (vídeo copiado sin recodificar) antes de unir.",
+            extra_label, main_info["sample_rate"], main_info["channels"],
+            extra_label, extra_info["sample_rate"], extra_info["channels"],
+        )
+        matched_path = out_path.with_name(f"_{extra_label}_audio_matched.mp4")
+        _match_audio_only(
+            extra_path, main_info, matched_path,
+            description=f"Ajustando audio del {extra_label} para unirlo sin recodificar el vídeo",
+        )
+        duration = _video_info(matched_path)["duration"]
+        _glue_with_faststart(
+            _ordered_for_position(main_path, matched_path, position), out_path,
+            description=f"Uniendo el clip principal con el {extra_label} (audio ya ajustado)",
+        )
+        matched_path.unlink(missing_ok=True)
+        return out_path, duration
+
+    logger.info(
+        "El %s no tiene la misma resolución/fps que el clip principal "
+        "(principal=%dx%d@%.2ffps, %s=%dx%d@%.2ffps); normalizando SOLO el %s (nunca el clip "
+        "principal, que no debe perder calidad) para poder unirlo sin recodificarlo a él.",
+        extra_label, main_info["width"], main_info["height"], main_info["fps"],
+        extra_label, extra_info["width"], extra_info["height"], extra_info["fps"], extra_label,
+    )
+    return _glue_via_full_recode(main_path, main_info, extra_path, position, out_path, extra_label)
 
 
 def append_outro(clip_path: str, config: dict) -> str:
     """
     Concatena assets/outro/outro.mp4 al final de clip_path, si
-    config['edit']['append_outro'] es true y el archivo existe.
-
-    Usa una concatenación rápida sin recodificar (concat demuxer, -c copy)
-    SOLO si se comprueba (vía ffprobe) que el outro tiene la misma
-    resolución/fps/sample rate/canales que el clip principal — el outro ya
-    debería prepararse así (ver README). Si no coinciden, recae en una
-    concatenación más lenta pero robusta vía filter_complex que normaliza
-    el outro a los parámetros del clip principal.
+    config['edit']['append_outro'] es true y el archivo existe -- ver
+    _glue_extra_clip (posición "after") para el mecanismo de unión.
 
     Returns:
         Ruta al clip final con el outro añadido, o clip_path sin cambios
@@ -1064,68 +1276,54 @@ def append_outro(clip_path: str, config: dict) -> str:
         )
         return clip_path
 
-    output_path = str(Path(clip_path).with_name("_with_outro.mp4"))
-    info = _video_info(Path(clip_path))
-    outro_info = _video_info(outro_path)
+    output_path = Path(clip_path).with_name("_with_outro.mp4")
+    result_path, _outro_duration = _glue_extra_clip(Path(clip_path), outro_path, "after", output_path, "outro")
+    return str(result_path)
 
-    if _same_stream_params(info, outro_info):
-        list_path = Path(clip_path).with_name("_outro_concat_list.txt")
-        list_path.write_text(
-            f"file '{Path(clip_path).resolve()}'\nfile '{outro_path.resolve()}'\n", encoding="utf-8"
-        )
-        fast_cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
-            "-c", "copy", "-movflags", "+faststart", output_path,
-        ]
-        logger.info("Añadiendo outro (concatenación rápida sin recodificar; mismos parámetros de stream)...")
-        result = subprocess.run(fast_cmd, capture_output=True, text=True)
-        list_path.unlink(missing_ok=True)
-        if result.returncode == 0:
-            return output_path
-        logger.warning(
-            "La concatenación rápida del outro falló pese a tener los mismos parámetros de stream; "
-            "recodificando el outro para que encaje con el clip principal:\n%s",
-            result.stderr[-1000:],
-        )
-    else:
+
+def _intro_path(video_id: str, config: dict) -> Path:
+    return (REPO_ROOT / config["paths"]["output"]).resolve() / video_id / "intro.mp4"
+
+
+def prepend_intro(clip_path: str, video_id: str, config: dict) -> str:
+    """
+    Antepone data/output/<video_id>/intro.mp4 al PRINCIPIO de clip_path, si
+    config['edit']['prepend_intro'] es true (default) y el archivo existe
+    -- ver _glue_extra_clip (posición "before") para el mecanismo de unión,
+    y "Intro grabado aparte" en el docstring del módulo para el contexto.
+
+    Retrocompatible: si el archivo no existe (el caso normal para
+    cualquier vídeo procesado antes de este cambio, o cualquiera sin
+    intro), devuelve clip_path sin tocarlo -- el pipeline se comporta
+    exactamente igual que antes de que existiera este paso.
+
+    Returns:
+        Ruta al clip con el intro añadido, o clip_path sin cambios si
+        prepend_intro está desactivado o no existe el archivo de intro.
+    """
+    edit_config = config.get("edit", {})
+    if not edit_config.get("prepend_intro", True):
+        logger.info("prepend_intro desactivado en config; se omite el intro.")
+        return clip_path
+
+    intro_path = _intro_path(video_id, config)
+    if not intro_path.exists() or intro_path.stat().st_size == 0:
         logger.info(
-            "El outro no tiene la misma resolución/fps/audio que el clip principal "
-            "(clip=%dx%d@%.2ffps/%sHz/%sch, outro=%dx%d@%.2ffps/%sHz/%sch); "
-            "recodificando el outro para que encaje.",
-            info["width"], info["height"], info["fps"], info["sample_rate"], info["channels"],
-            outro_info["width"], outro_info["height"], outro_info["fps"],
-            outro_info["sample_rate"], outro_info["channels"],
+            "No existe (o está vacío) %s; se continúa sin anteponer intro.",
+            intro_path,
         )
+        return clip_path
 
-    width, height, fps = info["width"], info["height"], info["fps"]
-    sample_rate = info["sample_rate"] or 48000
-    channel_layout = "stereo" if (info["channels"] or 2) >= 2 else "mono"
-
-    slow_cmd = [
-        "ffmpeg", "-y",
-        "-i", clip_path, "-i", str(outro_path),
-        "-filter_complex",
-        (
-            f"[1:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}[outro_v];"
-            f"[1:a]aformat=sample_rates={sample_rate}:channel_layouts={channel_layout}[outro_a];"
-            "[0:v][0:a][outro_v][outro_a]concat=n=2:v=1:a=1[vout][aout]"
-        ),
-        "-map", "[vout]", "-map", "[aout]",
-        "-c:v", "libx264", "-crf", "20", "-preset", "medium", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
-        "-movflags", "+faststart",
-        output_path,
-    ]
-    _run_ffmpeg(slow_cmd, description="Añadiendo outro (recodificando para compatibilidad)")
-
-    return output_path
+    output_path = Path(clip_path).with_name("_with_intro.mp4")
+    result_path, intro_duration = _glue_extra_clip(Path(clip_path), intro_path, "before", output_path, "intro")
+    logger.info("Intro añadido al principio del vídeo (%.2fs, %s).", intro_duration, intro_path.name)
+    return str(result_path)
 
 
 def run(video_id: str, config: dict) -> dict:
     """
-    Orquesta apply_cuts_with_zoom -> normalize_audio -> append_outro y
-    guarda el resultado en data/output/<video_id>/final.mp4.
+    Orquesta apply_cuts_with_zoom -> normalize_audio -> prepend_intro ->
+    append_outro y guarda el resultado en data/output/<video_id>/final.mp4.
 
     Returns:
         dict con {"video_id": str, "output_path": str}
@@ -1143,8 +1341,12 @@ def run(video_id: str, config: dict) -> dict:
     if normalized_path != clip_path:
         stage_paths.append(normalized_path)
 
-    final_stage_path = append_outro(normalized_path, config)
-    if final_stage_path != normalized_path:
+    with_intro_path = prepend_intro(normalized_path, video_id, config)
+    if with_intro_path != normalized_path:
+        stage_paths.append(with_intro_path)
+
+    final_stage_path = append_outro(with_intro_path, config)
+    if final_stage_path != with_intro_path:
         stage_paths.append(final_stage_path)
 
     out_dir = _output_dir(video_id, config)

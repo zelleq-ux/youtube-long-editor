@@ -51,6 +51,13 @@ mismo instante de acción.
 config['thumbnail']['enabled'] (por defecto true) permite desactivar el
 módulo entero sin tocar código: si es false, run() no hace nada (ni abre
 el vídeo) y lo deja claro en el log.
+
+Intro grabado aparte (2026-08-10, ver CLAUDE.md "Intro grabado aparte"):
+este módulo extrae candidatos ÚNICAMENTE de data/raw/<video_id>.mp4 (el
+contenido principal del stream); data/output/<video_id>/intro.mp4, si
+existe, nunca se abre aquí -- queda excluido de los candidatos por
+construcción, sin necesidad de ningún filtro adicional (igual que ya
+queda excluido el outro, que tampoco es data/raw/<video_id>.mp4).
 """
 from __future__ import annotations
 

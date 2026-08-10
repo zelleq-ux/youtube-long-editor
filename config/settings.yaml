@@ -6,11 +6,18 @@ paths:
   output: data/output
   outro: assets/outro/outro.mp4
 
-facecam_region:                  # posición aproximada (px, sobre el frame original) de la webcam del
-  x: 15                          # streamer. Compartido entre detect_cuts (recorte de intro por detección
-  y: 400                         # de cara) y edit (zoom hacia la webcam); no hace falta encuadrar la cara
-  w: 365                         # con precisión, solo aproximar la zona. Ajustar si cambia la disposición
-  h: 210                         # de la escena en OBS.
+facecam_region:                  # posición aproximada de la webcam del streamer, como FRACCIÓN 0.0-1.0
+  x: 0.007813                    # del frame (no píxeles absolutos, cambiado 2026-08-10 -- ver
+  y: 0.370370                    # src.common.face_detection.facecam_region_to_pixels): funciona igual sin
+  w: 0.190104                    # importar la resolución del vídeo, asumiendo que la webcam ocupa una
+  h: 0.194444                    # proporción similar del canvas de OBS entre grabaciones. Compartido entre
+                                  # detect_cuts (recorte de intro por detección de cara, exclusión de esta
+                                  # zona del cálculo de movimiento) y edit (zoom hacia la webcam); no hace
+                                  # falta encuadrar la cara con precisión, solo aproximar la zona. Valor
+                                  # exacto = conversión de la calibración original en píxeles sobre el frame
+                                  # 1920x1080 de dinoblade_1/icarus_1 (x:15,y:400,w:365,h:210) -- deriva el
+                                  # mismo recorte exacto para cualquier vídeo a esa resolución. Ajustar si
+                                  # cambia la disposición de la escena en OBS.
 
 transcribe:
   whisper_model: medium
@@ -61,6 +68,7 @@ edit:
                                     # final del tramo de habla). Tramos de habla más cortos que esto se quedan
                                     # sin zoom (no da tiempo a completar la rampa)
   loudnorm: true
+  prepend_intro: true      # antepone data/output/<video_id>/intro.mp4 (si existe) al principio del vídeo final
   append_outro: true
 
 thumbnail:

@@ -255,6 +255,57 @@ def main() -> int:
         f"result_min_sep={result_min_sep}",
     )
 
+    print("\n=== Parte 3: remap_chapters_to_edited_timeline con intro_duration_s (2026-08-10) ===")
+
+    # intro_duration_s=0.0 (default) debe reproducir EXACTAMENTE el resultado sin intro (Parte 2, caso 1).
+    result_no_shift = remap_chapters_to_edited_timeline(raw, cuts, duration, config, intro_duration_s=0.0)
+    check(
+        "intro_duration_s=0.0 es idéntico al comportamiento sin el parámetro (retrocompatible)",
+        result_no_shift == expected,
+        f"result_no_shift={result_no_shift}",
+    )
+
+    # Con un intro real de 90s: SIEMPRE 'Introducción' en 0.0 (representando el intro, no un
+    # capítulo genérico condicional) y el resto desplazado exactamente +90s.
+    result_with_intro = remap_chapters_to_edited_timeline(raw, cuts, duration, config, intro_duration_s=90.0)
+    check(
+        "con intro real: 'Introducción' fija en 0.0 y el resto desplazado +intro_duration_s",
+        result_with_intro == [
+            {"timestamp_s": 0.0, "title": "Introducción"},
+            {"timestamp_s": 580.0, "title": "Empieza el juego B"},
+            {"timestamp_s": 1275.0, "title": "Recta final del juego B"},
+        ],
+        f"result_with_intro={result_with_intro}",
+    )
+
+    # Un capítulo detectado por Claude cerca del inicio del vídeo original NO colapsa con la
+    # intro real: se desplaza +intro_duration_s como cualquier otro (a diferencia del caso SIN
+    # intro real, donde un capítulo casi en 0 se fusiona con el "Introducción" genérico) --
+    # siempre que la separación resultante siga cumpliendo min_chapter_seconds (120s aquí).
+    result_near_zero_with_intro = remap_chapters_to_edited_timeline(
+        [{"timestamp_original_s": 50.0, "title": "Primer tema real"}], [], 1000.0, config, intro_duration_s=90.0
+    )
+    check(
+        "con intro real: un capítulo detectado cerca de 0 se desplaza +90s en vez de colapsar con la intro",
+        result_near_zero_with_intro == [
+            {"timestamp_s": 0.0, "title": "Introducción"},
+            {"timestamp_s": 140.0, "title": "Primer tema real"},
+        ],
+        f"result={result_near_zero_with_intro}",
+    )
+
+    # Separación mínima re-aplicada tras el desplazamiento: un intro MÁS CORTO que
+    # min_chapter_seconds (120s) deja el primer capítulo real demasiado cerca de la intro -> se
+    # descarta (mismo criterio que ya se aplica entre capítulos consecutivos).
+    result_intro_too_close = remap_chapters_to_edited_timeline(
+        [{"timestamp_original_s": 10.0, "title": "Primer tema real"}], [], 1000.0, config, intro_duration_s=30.0
+    )
+    check(
+        "intro corta: un capítulo real que queda a <120s de la intro tras desplazarse se descarta",
+        result_intro_too_close == [{"timestamp_s": 0.0, "title": "Introducción"}],
+        f"result={result_intro_too_close}",
+    )
+
     if failures:
         print(f"\nFALLO: {len(failures)} comprobación(es) fallida(s):")
         for f in failures:

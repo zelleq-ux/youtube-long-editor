@@ -40,6 +40,21 @@ editada (convención de YouTube: el primer timestamp de la lista de
 capítulos debe ser 00:00) -- si Claude no propone ninguno prácticamente
 ahí, se antepone uno genérico ("Introducción").
 
+Intro grabado aparte (2026-08-10, ver CLAUDE.md "Intro grabado aparte"):
+si existe data/output/<video_id>/intro.mp4, este módulo antepone SIEMPRE
+un capítulo "Introducción" en 0:00 representando ese clip (en vez del
+genérico anterior, que solo se insertaba si Claude no proponía nada cerca
+de 0) y desplaza todos los capítulos ya calculados por la duración de ese
+intro (remap_chapters_to_edited_timeline, parámetro intro_duration_s).
+Esa duración se lee directamente (ffprobe) de intro.mp4 -- NOMINAL, sin
+calibrar contra un final.mp4 real, porque este módulo puede ejecutarse
+ANTES que edit/ (ver "Nota de orden" más abajo: los timestamps de
+capítulos ya son una aproximación a la línea de tiempo que producirá
+edit/, no una medición frame-exacta -- a diferencia de subtitles/, que sí
+espera a poder calibrar contra el vídeo final real porque necesita
+precisión de subsegundo). intro_duration_s=0.0 (el valor por defecto, sin
+intro.mp4) reproduce EXACTAMENTE el comportamiento anterior.
+
 Guarda data/chapters/<video_id>/chapters.json (línea de tiempo editada) y
 data/output/<video_id>/chapters.txt en formato listo para pegar en la
 descripción de YouTube, p.ej.:
@@ -62,6 +77,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import subprocess
 from pathlib import Path
 
 import anthropic
@@ -128,6 +144,24 @@ def _cuts_path(video_id: str, config: dict) -> Path:
             f"Ejecuta primero la etapa de detección de cortes (python -m src.detect_cuts.run --video-id {video_id})."
         )
     return path
+
+
+def _intro_path(video_id: str, config: dict) -> Path:
+    return (REPO_ROOT / config["paths"]["output"]).resolve() / video_id / "intro.mp4"
+
+
+def _probe_duration(path: Path) -> float | None:
+    """ffprobe format=duration de `path`, o None si no existe o ffprobe falla."""
+    if not path.exists():
+        return None
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return None
 
 
 def _format_transcript_for_prompt(transcript: dict) -> str:
@@ -298,7 +332,8 @@ def _enforce_min_separation(chapters: list[dict], min_seconds: float) -> list[di
 
 
 def remap_chapters_to_edited_timeline(
-    raw_chapters: list[dict], cuts: list[dict], duration: float, config: dict
+    raw_chapters: list[dict], cuts: list[dict], duration: float, config: dict,
+    intro_duration_s: float = 0.0,
 ) -> list[dict]:
     """
     Convierte `raw_chapters` (timestamps del vídeo ORIGINAL, ver
@@ -313,12 +348,21 @@ def remap_chapters_to_edited_timeline(
        línea de tiempo editada (ver _enforce_min_separation) -- los
        cortes pueden acercar capítulos que en el original estaban bien
        separados.
-    4. Se garantiza que el primer capítulo quede exactamente en 0.0: si el
-       primero que sobrevive ya está prácticamente ahí (ver
-       _FIRST_CHAPTER_EPSILON_SECONDS) se fuerza a 0.0 exacto; si no, se
-       antepone uno genérico ("Introducción") y se reaplica la
-       separación mínima (el capítulo genérico en 0.0 puede a su vez
-       descartar por cercanía al que antes era el primero).
+    4a. Si intro_duration_s > 0 (existe data/output/<video_id>/intro.mp4,
+        ver CLAUDE.md "Intro grabado aparte"): TODOS los capítulos de
+        arriba se desplazan +intro_duration_s y se antepone un capítulo
+        fijo "Introducción" en 0.0 representando ese clip -- 0:00 ya no lo
+        disputa ningún capítulo detectado por Claude, lo posee el intro
+        real. Se reaplica la separación mínima por si el primer capítulo
+        real, tras desplazarse, sigue cayendo demasiado cerca de 0.0.
+    4b. Si intro_duration_s == 0.0 (el valor por defecto, sin intro real):
+        comportamiento EXACTO de siempre -- se garantiza que el primer
+        capítulo quede exactamente en 0.0: si el primero que sobrevive ya
+        está prácticamente ahí (ver _FIRST_CHAPTER_EPSILON_SECONDS) se
+        fuerza a 0.0 exacto; si no, se antepone uno genérico
+        ("Introducción") y se reaplica la separación mínima (el capítulo
+        genérico en 0.0 puede a su vez descartar por cercanía al que
+        antes era el primero).
 
     Returns:
         [{"timestamp_s": float, "title": str}, ...] ordenado por tiempo,
@@ -342,6 +386,14 @@ def remap_chapters_to_edited_timeline(
 
     remapped.sort(key=lambda c: c["timestamp_s"])
     remapped = _enforce_min_separation(remapped, min_seconds)
+
+    if intro_duration_s > 0:
+        shifted = [
+            {"timestamp_s": round(c["timestamp_s"] + intro_duration_s, 3), "title": c["title"]}
+            for c in remapped
+        ]
+        with_intro = [{"timestamp_s": 0.0, "title": _GENERIC_INTRO_TITLE}] + shifted
+        return _enforce_min_separation(with_intro, min_seconds)
 
     if remapped and remapped[0]["timestamp_s"] <= _FIRST_CHAPTER_EPSILON_SECONDS:
         remapped[0]["timestamp_s"] = 0.0
@@ -397,7 +449,26 @@ def run(video_id: str, config: dict) -> dict:
     )
 
     raw_chapters = detect_chapters_with_claude(transcript, config)
-    chapters = remap_chapters_to_edited_timeline(raw_chapters, cuts, duration, config)
+
+    intro_duration_s = 0.0
+    intro_path = _intro_path(video_id, config)
+    if intro_path.exists():
+        probed = _probe_duration(intro_path)
+        if probed is not None and probed > 0:
+            intro_duration_s = probed
+            logger.info(
+                "Intro detectado en %s (%.2fs); se antepondrá como capítulo 'Introducción' en 0:00 y "
+                "se desplazarán %.2fs el resto de capítulos.",
+                intro_path, intro_duration_s, intro_duration_s,
+            )
+        else:
+            logger.warning(
+                "No se pudo determinar la duración de %s; se ignora para los capítulos "
+                "(se comporta como si no existiera).",
+                intro_path,
+            )
+
+    chapters = remap_chapters_to_edited_timeline(raw_chapters, cuts, duration, config, intro_duration_s)
 
     logger.info(
         "%d capítulo(s) final(es) tras remapeo a la línea de tiempo editada y validación de separación mínima.",
