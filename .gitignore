@@ -8,6 +8,7 @@ data/cuts/*
 data/chapters/*
 data/output/*
 data/pipeline.db
+data/work/
 !data/**/.gitkeep
 client_secret.json
 token.json
