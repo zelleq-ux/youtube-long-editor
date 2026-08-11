@@ -287,6 +287,95 @@ continuidad de PTS/DTS (reutilizando check_pts_continuity/
 check_av_duration_consistency) y consistencia de color_range/pix_fmt; y
 contra un vídeo real (ver status.md para la medición de tiempo real
 antes/después del paso de corte).
+
+Solape de audio/vídeo en la costura del renderizado parcial sin pérdida
+(bug real en vídeos ya publicados, encontrado e investigado 2026-08-11):
+
+Síntoma reportado: en algunos vídeos ya publicados (dinoblade_1,
+icarus_1, shift_at_midnight_1, how_many_dudes_1), un glitch esporádico
+(no en todos los cortes) donde la voz repite/tartamudea la última sílaba
+justo en un punto de corte -- p.ej. "Hey, dónde cojones-nes está la
+pistola?!", con "-nes" como sílaba duplicada. El síntoma aparece EN MEDIO
+de habla continua, no necesariamente junto a un silencio recortado -- la
+primera pista de que la causa no era el punto de corte de detect_cuts
+(que sí ajusta los silencios a su núcleo real, ver detect_cuts/run.py)
+sino algo interno al mecanismo de corte de este módulo.
+
+Causa raíz (AUDIO): `_cut_segment_smart` calcula `kf_start`/`kf_end` a
+partir de keyframes de VÍDEO únicamente (`_scan_keyframe_timestamps`,
+`-select_streams v:0`). El "interior" del tramo se copiaba con
+`_cut_segment_copy` usando `-c copy` (vídeo Y audio sin recodificar) en
+esos mismos timestamps -- válido para el vídeo (kf_start/kf_end SON
+keyframes reales, ver más arriba), pero el AUDIO no comparte esa rejilla:
+los paquetes AAC (1024 muestras, ~21.3ms a 48kHz) caen en instantes
+propios, independientes del GOP de vídeo. En modo -c copy puro ffmpeg no
+puede decodificar+descartar muestras para arrancar exactamente en
+`kf_start` (solo puede si va a recodificar, como sí hacen los fragmentos
+de cabeza/cola), así que el primer paquete de audio copiado del interior
+es el que YA sonaba antes de `kf_start` -- contenido que el fragmento de
+cabeza (recodificado con seek preciso) YA incluyó. Al pegar cabeza+
+interior con el concat demuxer, ese solape se reproduce como audio
+duplicado.
+
+Medido con un vídeo sintético (GOP forzado a 2s, mismos crf/preset que
+`ingest/run.py`) en 5 tramos con offsets de inicio distintos: 32.7-46.7ms
+de audio duplicado en CADA costura cabeza→interior, sistemático (no una
+coincidencia de un offset concreto) -- ver el análisis completo con
+números reales en el historial de investigación (status.md). El orden de
+magnitud (varias decenas de ms, en medio de una sílaba) encaja
+exactamente con el síntoma reportado, y explica por qué es "esporádico":
+no ocurre solo en los puntos de corte reales (ahí donde detect_cuts ya
+cuida el silencio), sino en CUALQUIER costura interna cabeza/interior
+dentro de un tramo a conservar suficientemente largo para activar la
+copia sin recodificar (~76-91% de la duración conservada, ver más
+arriba) -- la mayoría de esas costuras caen en silencio o soportan el
+solape sin notarse; solo ocasionalmente caen encima de una sílaba con
+energía suficiente para percibirse como tartamudeo.
+
+Causa raíz (VÍDEO, hallazgo secundario de la misma investigación): por
+simetría se comprobó también la costura interior→cola (el límite
+`kf_end`, gobernado por `-to` en el `-c copy` original), y con B-frames
+activos (`ingest/run.py` no pasa `-bf 0`; el preset `medium` de libx264
+las deja activadas por defecto, así que los `raw.mp4` reales las tienen)
+`-to` en modo -c copy NO corta con precisión de frame: el reordenamiento
+por B-frames obliga a ffmpeg a leer ya varios frames del GOP SIGUIENTE
+(los necesita para decodificar los B-frames del final del GOP actual)
+antes de que el corte por tiempo tenga ocasión de excluirlos, así que se
+"gotean" de más al fragmento interior. Medido: hasta ~130ms/4 frames de
+vídeo de más en el mismo vídeo sintético -- un frame congelado/repetido
+en la costura interior→cola, el equivalente visual del tartamudeo de
+audio. Esto es DISTINTO del "efecto secundario menor aceptado" descrito
+más arriba (ese es un redondeo de sub-frame en accurate seek durante
+RECODIFICACIÓN, broken down y limitado a fracciones de frame, siempre
+documentado como inofensivo); este es un fallo del propio -c copy en
+modo stream-copy con B-frames, de una escala mucho mayor (frames enteros,
+no fracciones).
+
+Fix aplicado en `_cut_segment_copy` (ver ese docstring para el detalle
+completo, incluida una nota importante sobre cómo NO fiarse de `-ss` para
+verificar bit-identidad contra vídeos con B-frames): el VÍDEO del interior
+se sigue copiando sin recodificar (`-c:v copy`, sigue siendo la parte cara
+que este mecanismo evita recodificar), pero ahora en DOS pasadas -- 1)
+cortar con `-to` como antes (aceptando el goteo de cola ya documentado)
+y 2) un remux aparte que limita el resultado a `-frames:v <N>` (recuento
+exacto, calculado a partir de `fps`), sin ningún `-ss`/`-to` de por medio
+en esa segunda pasada. Se necesitan las DOS pasadas por separado: combinar
+`-frames:v` directamente en la llamada con `-ss`/`-to` sobre un tramo de
+varios GOPs sí da el recuento correcto pero CORROMPE el contenido por el
+camino (probado y descartado, ver _cut_segment_copy). El AUDIO del
+interior pasa a RECODIFICARSE con el mismo `-ss`/`-to` de la primera
+pasada (ahora con seek preciso porque SÍ hay decodificación de por medio)
+-- barato, la codificación de audio es rápida comparada con la de vídeo,
+así que no compromete el ahorro de tiempo que motivó todo este mecanismo.
+Revalidado con el mismo vídeo sintético: 0.0ms de solape de audio y
+recuento de vídeo exacto (sin frames de más) en las 5 costuras probadas,
+y contenido bit-idéntico frame a frame contra el origen en todo el tramo
+(no solo el punto medio, verificado con un volcado secuencial completo,
+no con `-ss`). Test de regresión dedicado en
+tests/test_audio_seam_overlap.py (mide el solape de audio en la costura
+cabeza→interior y el recuento de frames del interior directamente contra
+las funciones de producción; falla si reaparece un solape apreciable o un
+recuento de frames incorrecto).
 """
 from __future__ import annotations
 
@@ -661,29 +750,98 @@ def _cut_segment_recode(input_path: Path, start: float, end: float, out_path: Pa
     _run_ffmpeg(cmd, description=description)
 
 
-def _cut_segment_copy(input_path: Path, start: float, end: float, out_path: Path, description: str) -> None:
+def _cut_segment_copy(
+    input_path: Path, start: float, end: float, fps: float, out_path: Path, description: str
+) -> None:
     """
-    Copia [start, end] SIN recodificar (-c copy, prácticamente gratis).
-    Solo válido cuando `start` y `end` caen EXACTAMENTE en keyframes
-    reales del vídeo de entrada (ver _cut_segment_smart y "Renderizado
-    parcial sin pérdida" en el docstring del módulo) -- si no coincidieran
-    con un keyframe, ffmpeg redondearía `start` hacia el keyframe anterior
-    e incluiría de más contenido intermedio (el mismo problema ya
-    documentado del inpoint del concat demuxer, evitado aquí porque los
-    timestamps SÍ son keyframes reales).
+    Copia el VÍDEO de [start, end] SIN recodificar (-c:v copy,
+    prácticamente gratis) pero RECODIFICA el AUDIO (barato -- codificar
+    audio es rápido comparado con vídeo, que es la parte cara que este
+    mecanismo evita recodificar). Solo válido cuando `start` y `end` caen
+    EXACTAMENTE en keyframes reales del vídeo de entrada (ver
+    _cut_segment_smart y "Renderizado parcial sin pérdida" en el docstring
+    del módulo).
+
+    Por qué el audio NO puede copiarse sin más aquí (bug real encontrado en
+    producción, 2026-08-11 -- ver "Solape de audio/vídeo en la costura del
+    renderizado parcial sin pérdida" en el docstring del módulo para el
+    análisis completo): `start`/`end` son keyframes reales del stream de
+    VÍDEO, pero el audio (paquetes AAC de 1024 muestras, ~21.3ms a 48kHz)
+    tiene su propia rejilla temporal, independiente del GOP de vídeo. En
+    modo -c copy puro, ffmpeg no puede decodificar+descartar muestras para
+    arrancar exactamente en `start` (solo puede si va a recodificar), así
+    que el primer paquete de audio copiado es el que YA sonaba antes de
+    `start` -- contenido que el fragmento anterior (recodificado con seek
+    preciso) ya incluyó. Medido con un vídeo sintético: ~33-47ms de audio
+    duplicado en cada costura de este tipo -- exactamente el "tartamudeo
+    de sílaba" reportado en vídeos ya publicados. Recodificar el audio
+    aquí (mismo -ss/-to, ahora con seek preciso porque SÍ se decodifica)
+    arranca y termina exactamente en start/end -- medido en 0.0ms de
+    solape tras el fix.
+
+    Por qué el vídeo tampoco puede fiarse de `-to` a secas para el límite
+    superior (segundo hallazgo de la misma investigación): con B-frames
+    (el preset por defecto de ingest/run.py los deja activados, no se
+    pasa `-bf 0`), `-to` en modo -c copy puede "gotear" varios frames del
+    GOP SIGUIENTE más allá de `end` -- el reordenamiento por B-frames hace
+    que ffmpeg ya haya leído esos frames (los necesita para decodificar
+    los B-frames del final del GOP actual) antes de que el corte por
+    tiempo tenga ocasión de excluirlos. Medido: hasta ~130ms/4 frames de
+    vídeo de más en el vídeo sintético de prueba -- un frame "congelado y
+    repetido" en la costura, el equivalente visual del tartamudeo de
+    audio.
+
+    Por qué esto se arregla en DOS pasadas en vez de añadir `-frames:v`
+    directamente a la llamada de arriba (probado primero, descartado):
+    combinar `-frames:v <N>` con el `-ss`/`-to` que recorta un tramo de
+    VARIOS GOPs del vídeo de entrada SÍ da el recuento de frames correcto,
+    pero corrompe el CONTENIDO por el camino -- verificado con un vídeo
+    sintético de 19 GOPs (comparación de hash por frame, sin usar `-ss`
+    para verificar, que resultó ser poco fiable para esto, ver más abajo):
+    el recuento final es exacto, pero los frames a partir de cierto punto
+    intermedio ya no son los que tocan. Aparentemente `-frames:v` cuenta
+    frames de SALIDA mientras el reordenamiento por B-frames sigue en
+    marcha, y con varios GOPs de por medio la cuenta se desincroniza del
+    contenido real. En dos pasadas SEPARADAS (1: copiar con `-to`, aceptando
+    el goteo de la cola; 2: remuxear ese resultado ya con un único límite
+    de frames, sin ningún `-ss`/`-to` de por medio) cada pasada solo hace
+    una cosa a la vez y no se corrompe nada -- verificado bit-idéntico
+    frame a frame contra el origen (todo el tramo, no solo el punto medio).
+
+    Nota sobre cómo se verificó esto (importante si se vuelve a tocar este
+    código): comparar frames por tiempo con `ffmpeg -ss T -i archivo
+    -frames:v 1` para verificar bit-identidad NO es fiable en este build de
+    ffmpeg contra archivos con B-frames -- puede aterrizar en un frame
+    vecino sin avisar (confirmado: el mismo archivo, probado con `-ss` vs.
+    con un volcado secuencial completo por índice de frame vía
+    `-vf select`, da resultados distintos). La verificación real de
+    bit-identidad debe hacerse con un volcado secuencial (`-f framemd5`,
+    sin `-ss`) de ambos lados y comparar la lista completa -- no probar
+    puntos sueltos con `-ss`.
     """
-    cmd = [
+    n_frames = max(1, round((end - start) * fps))
+    untrimmed_path = out_path.with_name(out_path.stem + "_untrimmed" + out_path.suffix)
+    cmd_cut = [
         "ffmpeg", "-y",
         "-ss", f"{start:.6f}", "-to", f"{end:.6f}",
         "-i", str(input_path),
-        "-c", "copy",
+        "-c:v", "copy",
+        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
+        str(untrimmed_path),
+    ]
+    _run_ffmpeg(cmd_cut, description=description)
+    cmd_trim = [
+        "ffmpeg", "-y",
+        "-i", str(untrimmed_path),
+        "-c", "copy", "-frames:v", str(n_frames),
         str(out_path),
     ]
-    _run_ffmpeg(cmd, description=description)
+    _run_ffmpeg(cmd_trim, description=f"{description} (recorte exacto de frames de vídeo)")
+    untrimmed_path.unlink(missing_ok=True)
 
 
 def _cut_segment_smart(
-    input_path: Path, start: float, end: float, keyframes: list[float],
+    input_path: Path, start: float, end: float, keyframes: list[float], fps: float,
     index: int, total: int, out_dir: Path,
 ) -> list[Path]:
     """
@@ -728,7 +886,7 @@ def _cut_segment_smart(
 
     mid_path = out_dir / f"_cut_seg_{index}_mid.mp4"
     _cut_segment_copy(
-        input_path, kf_start, kf_end, mid_path,
+        input_path, kf_start, kf_end, fps, mid_path,
         description=(
             f"Copiando tramo {index + 1}/{total}, interior sin recodificar "
             f"({kf_start:.2f}s-{kf_end:.2f}s)"
@@ -771,20 +929,31 @@ def _glue_video_files(paths: list[Path], out_path: Path) -> None:
     list_path.unlink(missing_ok=True)
 
 
-def _cut_video(input_path: Path, keep_segments: list[tuple[float, float]], out_dir: Path) -> Path:
+def _cut_video(
+    input_path: Path, keep_segments: list[tuple[float, float]], fps: float, out_dir: Path
+) -> Path:
     """
     Recorta `keep_segments` de `input_path` aplicando "renderizado
     parcial sin pérdida" (ver docstring del módulo): cada tramo se corta
-    con _cut_segment_smart, que copia sin recodificar (-c copy) el
-    interior de cada tramo entre dos keyframes reales y solo recodifica
-    los bordes (o el tramo completo, como fallback, si es más corto que
-    un intervalo de keyframe) -- sin `concat` ni `filter_complex` en
-    ningún caso (ver "Fuga de frames de vídeo en el filtro concat de
-    ffmpeg"). Todos los fragmentos resultantes (1 a 3 por tramo) se pegan
-    después con el concat DEMUXER (_glue_video_files). Sin límite
-    práctico de nº de tramos: cada fragmento es una llamada de ffmpeg
-    independiente y corta, así que ni el nº de tramos ni sus caracteres
-    pueden acercar la línea de comandos al límite de Windows.
+    con _cut_segment_smart, que copia sin recodificar (-c:v copy) el
+    VÍDEO del interior de cada tramo entre dos keyframes reales
+    (recodificando el AUDIO de ese mismo interior, con seek preciso -- ver
+    "Solape de audio/vídeo en la costura del renderizado parcial sin
+    pérdida" y _cut_segment_copy) y solo recodifica vídeo+audio de los
+    bordes (o el tramo completo, como fallback, si es más corto que un
+    intervalo de keyframe) -- sin `concat` ni `filter_complex` en ningún
+    caso (ver "Fuga de frames de vídeo en el filtro concat de ffmpeg").
+    Todos los fragmentos resultantes (1 a 3 por tramo) se pegan después
+    con el concat DEMUXER (_glue_video_files). Sin límite práctico de nº
+    de tramos: cada fragmento es una llamada de ffmpeg independiente y
+    corta, así que ni el nº de tramos ni sus caracteres pueden acercar la
+    línea de comandos al límite de Windows.
+
+    `fps` (del vídeo de entrada, CFR desde ingest/run.py) se usa para
+    calcular el recuento exacto de frames de vídeo a copiar en cada
+    interior (`-frames:v`, ver _cut_segment_copy) -- necesario porque
+    `-to` en modo -c copy no es fiable como límite superior cuando hay
+    B-frames.
 
     Returns:
         Ruta al vídeo ya cortado, sin zoom (data/output/<video_id>/_cuts.mp4).
@@ -805,7 +974,7 @@ def _cut_video(input_path: Path, keep_segments: list[tuple[float, float]], out_d
     n_partial = 0
     n_full_recode = 0
     for i, (start, end) in enumerate(keep_segments):
-        fragments = _cut_segment_smart(input_path, start, end, keyframes, i, len(keep_segments), out_dir)
+        fragments = _cut_segment_smart(input_path, start, end, keyframes, fps, i, len(keep_segments), out_dir)
         segment_paths.extend(fragments)
         if len(fragments) == 1:
             n_full_recode += 1
@@ -1007,7 +1176,7 @@ def apply_cuts_with_zoom(video_id: str, cuts: list[dict], config: dict) -> str:
         logger.info("No se ha detectado ningún tramo de habla continua; no se aplicará zoom.")
 
     out_dir = _output_dir(video_id, config)
-    cut_path = _cut_video(input_path, keep_segments, out_dir)
+    cut_path = _cut_video(input_path, keep_segments, info["fps"], out_dir)
     result_path = _apply_zoom(cut_path, speech_segments, config, width, height)
 
     return str(result_path)

@@ -72,6 +72,33 @@ enseñados al usuario para su revisión -- pendiente de que elija/componga
 uno como `thumbnail.png` (paso manual, ya no lo hace ningún módulo) y de
 su aprobación final antes de comitear.
 
+**Bug de audio investigado y arreglado (2026-08-11), reportado en vídeos ya
+publicados (dinoblade_1, icarus_1, shift_at_midnight_1,
+how_many_dudes_1):** tartamudeo esporádico de sílaba ("cojones-nes") en
+puntos internos del renderizado parcial sin pérdida de `edit/run.py`, no
+en los puntos de corte de `detect_cuts` (esos ya ajustan el silencio a su
+núcleo real, no eran la causa). Causa raíz: `_cut_segment_copy` copiaba
+vídeo Y audio sin recodificar (`-c copy`) en `kf_start`/`kf_end`
+-- válido para vídeo (son keyframes reales) pero no para audio (rejilla
+temporal propia, independiente del GOP) ni, con B-frames activas, para el
+límite superior del propio vídeo (goteo de frames del GOP siguiente).
+Medido con vídeo sintético: ~33-47ms de audio duplicado en cada costura
+cabeza→interior, y hasta ~130ms de vídeo de más en la costura
+interior→cola. Fix en `_cut_segment_copy`: audio del interior
+RECODIFICADO con seek preciso (barato); vídeo del interior en DOS pasadas
+(copiar + remux con recuento exacto de frames -- combinar `-frames:v` en
+una sola pasada con el `-ss`/`-to` original corrompía el contenido a
+mitad de tramo, descartado tras verificarlo). Revalidado: 0.0ms de
+solape, recuento de vídeo exacto, contenido bit-idéntico frame a frame.
+Detalle completo (incluida una nota sobre cómo NO verificar bit-identidad
+con `-ss` en archivos con B-frames, que dio falsos positivos/negativos
+durante esta misma investigación) en el docstring de `src/edit/run.py`
+("Solape de audio/vídeo en la costura..."). Test de regresión:
+`tests/test_audio_seam_overlap.py` (nuevo) + `tests/test_smart_cut_segments.py`
+(bit-identity check reescrito para no depender de `-ss`). No se ha tocado
+ningún vídeo ya publicado -- el fix es solo para próximas ediciones.
+Diagnóstico y fix confirmados por el usuario, comiteados.
+
 Un bloqueo pendiente, no trabajo pendiente de implementación:
 
 1. **Confirmación explícita para la primera subida real a YouTube:**
