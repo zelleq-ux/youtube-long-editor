@@ -376,6 +376,111 @@ tests/test_audio_seam_overlap.py (mide el solape de audio en la costura
 cabeza→interior y el recuento de frames del interior directamente contra
 las funciones de producción; falla si reaparece un solape apreciable o un
 recuento de frames incorrecto).
+
+Fusión de cortes con hueco mínimo insuficiente (bug real reportado tras
+publicar witchfire_1 ya con el fix de arriba aplicado, investigado y
+arreglado 2026-08-12):
+
+Síntoma reportado: entre 56:00-57:52 de `final.mp4` sonaban muchos cortes
+seguidos "en ametralladora" en un tramo de lectura continua (el narrador
+del juego leyendo una carta, con la pantalla estática). Investigado a
+fondo con datos reales ANTES de tocar código (ver status.md para el
+detalle completo de la investigación): la forma de onda no mostraba
+discontinuidades objetivas en las costuras individuales -- cada corte
+técnicamente limpio, y confirmado explícitamente que el fix de solape de
+audio de arriba seguía funcionando bien en ese mismo tramo real (0 solape,
+verificado contra el `raw.mp4` real, no un sintético). La causa era
+densidad: 22 cortes en ~170s (~2.8x la media del vídeo), varios separados
+por menos de 3s -- cada empalme técnicamente correcto, pero encadenarlos
+tan seguidos suena mal EN CONJUNTO. El usuario quería mantener intacta la
+sensibilidad de detección (esa densidad de cortes es DELIBERADA, le gusta
+ese dinamismo) -- el fix no podía tocar `silence_min_seconds` ni
+`motion_threshold`.
+
+`merge_short_kept_segments` (`src/common/timeline.py`, no en este módulo
+-- es una utilidad compartida, usada también por `subtitles/run.py`, ver
+más abajo) funde dos cortes consecutivos cuando el tramo conservado ENTRE
+ellos es más corto que `config['edit']['min_kept_segment_seconds']`
+(0.6s por defecto), absorbiendo también ese tramo en vez de dejarlo como
+una isla de audio casi imperceptible. Valor elegido con datos reales de
+witchfire_1 (no arbitrario): de los 81 tramos conservados <2.5s en todo
+el vídeo, hasta 0.5s los seis afectados estaban TODOS vacíos de palabras
+transcritas (0 pérdida real de contenido); en 0.6s se pierde una única
+palabra suelta y poco informativa ("Ahora") a cambio de capturar la única
+isla realmente vacía (0.528s) que había dentro de la propia ventana
+investigada -- por encima de 0.6s empiezan a perderse reacciones cortas
+con contenido real ("¿O qué?", "Vale.", "¡Hostia!"), justo lo que no se
+quería tocar.
+
+Aplicado en `apply_cuts_with_zoom` (sobre `cuts` antes de calcular
+`keep_segments`, así que también afecta a `detect_long_speech_segments`
+de forma consistente) y en `subtitles/run.py` (mismo umbral, sobre el
+`cuts` cargado de `cuts.json` antes de `map_to_edited_timeline`) --
+IMPRESCINDIBLE en subtítulos también: si `edit/` funde cortes pero
+`subtitles/` remapea contra el `cuts.json` sin fundir, su calibración de
+deriva (ver más arriba, "Calibración contra el vídeo final real" en
+subtitles/run.py) mediría una duración nominal que ya no corresponde a lo
+que `edit/` realmente cortó, introduciendo un desajuste de sincronización
+real. NO aplicado en `detect_chapters/` a propósito: sus marcadores
+toleran `min_chapter_seconds=120`, así que unos segundos de diferencia
+por no fundir ahí son completamente imperceptibles -- no vale la pena la
+complejidad de tocar ese módulo también.
+
+Micro-crossfade en los empalmes de audio (misma investigación,
+2026-08-12): además de la densidad, el usuario pidió suavizar la
+SEQUEDAD de cada corte individual -- un crossfade equal-power (curva
+coseno/seno, el mismo estándar que implementa `acrossfade curve=qsin` de
+ffmpeg, elegido explícitamente en vez de un crossfade LINEAL porque este
+último sí produce un bajón de volumen perceptible en la transición) de
+`config['edit']['audio_crossfade_ms']` (20ms por defecto) en CADA unión
+entre fragmentos al cortar -- tanto interior-copiado como recodificación
+completa, sin distinción (`_glue_video_files` ya trata ambos como una
+lista plana de fragmentos a unir, así que aplicar el crossfade de forma
+uniforme sobre esa misma lista es natural). El VÍDEO se sigue
+concatenando exactamente igual que siempre (concat demuxer, `-c copy`,
+sin crossfade -- solo el audio se sustituye).
+
+Por qué NO se implementa encadenando el filtro `acrossfade` de ffmpeg
+(la opción obvia, descartada tras considerarla): con cientos de
+fragmentos por vídeo, encadenar esa cantidad de operaciones en un
+filter_complex corre el mismo riesgo de escala ya documentado para el
+filtro `concat` más arriba ("Fuga de frames de vídeo..."); y hacerlo en
+múltiples pasadas de ffmpeg con AAC como formato intermedio acumularía
+generaciones de recodificación con pérdida en el audio que participa de
+varios crossfades seguidos. En su lugar (`_decode_audio_float32`,
+`_equal_power_crossfade_concat`, `_write_crossfaded_audio` en este
+módulo), el audio de cada fragmento se decodifica a PCM/NumPy (barato:
+audio, no vídeo), se funde con la curva equal-power en Python, y solo se
+recodifica a AAC UNA vez al final -- todo el proceso intermedio es sin
+pérdida.
+
+Corrección de duración (`_resample_to_length`): un crossfade de N
+muestras acorta el audio combinado en N muestras por cada unión --
+consecuencia matemática inevitable de solapar contenido en vez de
+concatenarlo seco (es literalmente lo que hace un crossfade). El vídeo,
+sin embargo, no se acorta (se pidió explícitamente que no llevara
+crossfade). Sin corregir esto, el audio se habría ido desincronizando
+PROGRESIVAMENTE del vídeo a lo largo de todo el vídeo (varios segundos
+acumulados en una grabación de 1-2h con cientos de cortes) -- se corrige
+con un único reestiramiento global e imperceptible al final (~0.2% típico
+en una grabación real, muy por debajo del umbral perceptible de cambio de
+tempo en audio hablado, ~2-5%), interpolación lineal simple (no hace
+falta una librería de time-stretch con preservación de tono a esta
+escala), para que el audio quede sample-exacto con la duración real del
+vídeo ya concatenado. Validado explícitamente contra el test de escala
+completo (1h/400 cortes, ver scale_test_edit_pipeline.py) con
+merge+crossfade ya activados por defecto: sin discontinuidades de PTS ni
+desajuste de duración audio/vídeo.
+
+Validado con fragmentos REALES de witchfire_1 (no solo sintéticos, ver
+tests/test_merge_short_kept_segments.py y tests/test_audio_crossfade.py):
+en las costuras reales con una discontinuidad apreciable en el corte
+duro, el crossfade la reduce sustancialmente (p.ej. de 0.068 a 0.020 en
+escala -1..1); ninguna costura con crossfade se acerca a escala de click
+audible. Clips ANTES/DESPUÉS de la ventana reportada, generados con estas
+mismas funciones de producción sobre el `raw.mp4` real (no el
+`final.mp4` ya publicado), confirmados de oído por el usuario. No se ha
+tocado ningún vídeo ya publicado.
 """
 from __future__ import annotations
 
@@ -392,7 +497,7 @@ from pathlib import Path
 from src.common import db
 from src.common.config import REPO_ROOT, load_config
 from src.common.face_detection import facecam_region_to_pixels
-from src.common.timeline import compute_keep_segments, map_to_edited_timeline
+from src.common.timeline import compute_keep_segments, map_to_edited_timeline, merge_short_kept_segments
 
 logger = logging.getLogger(__name__)
 
@@ -929,8 +1034,194 @@ def _glue_video_files(paths: list[Path], out_path: Path) -> None:
     list_path.unlink(missing_ok=True)
 
 
+# Formato de audio interno fijo para el crossfade -- coincide con lo que
+# YA producen _cut_segment_recode/_cut_segment_copy (48kHz estéreo) para
+# todos los fragmentos, así que decodificar a este formato nunca hace
+# falta re-muestrear ni mezclar canales.
+_CROSSFADE_SR = 48000
+_CROSSFADE_CHANNELS = 2
+
+
+def _decode_audio_float32(path: Path) -> "np.ndarray":
+    """
+    Decodifica el audio de `path` a un array numpy float32
+    (n_muestras, _CROSSFADE_CHANNELS) a _CROSSFADE_SR, vía ffmpeg (pipeado
+    por stdout, sin archivo temporal intermedio) -- soporta cualquier
+    códec/contenedor de entrada, no solo los formatos que soundfile puede
+    leer directamente (los fragmentos son .mp4/AAC).
+    """
+    import numpy as np
+
+    cmd = [
+        "ffmpeg", "-v", "error", "-i", str(path),
+        "-f", "f32le", "-acodec", "pcm_f32le",
+        "-ar", str(_CROSSFADE_SR), "-ac", str(_CROSSFADE_CHANNELS),
+        "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg falló decodificando audio de {path}:\n"
+            f"{result.stderr[-2000:].decode('utf-8', errors='replace')}"
+        )
+    audio = np.frombuffer(result.stdout, dtype=np.float32)
+    if audio.size % _CROSSFADE_CHANNELS != 0:
+        audio = audio[: audio.size - (audio.size % _CROSSFADE_CHANNELS)]
+    return audio.reshape(-1, _CROSSFADE_CHANNELS)
+
+
+def _equal_power_crossfade_concat(fragment_paths: list[Path], crossfade_ms: float) -> "np.ndarray":
+    """
+    Decodifica el audio de cada fragmento de `fragment_paths` (en orden) y
+    los concatena aplicando un crossfade EQUAL-POWER (curva coseno/seno --
+    la misma curva que implementa el filtro `acrossfade` de ffmpeg con
+    `curve=qsin`, el estándar recomendado para crossfades cortos de voz:
+    mantiene la potencia percibida constante durante la transición,
+    a diferencia de un crossfade LINEAL que sí produce un bajón de volumen
+    perceptible en el punto medio) de `crossfade_ms` en CADA unión -- ver
+    "Micro-crossfade en los empalmes de audio" en el docstring del módulo
+    para el porqué y para por qué esto se implementa en numpy en vez de
+    encadenar el filtro `acrossfade` de ffmpeg.
+
+    `crossfade_ms` <= 0 desactiva el crossfade (concatenación directa,
+    sample a sample, sin mezcla -- útil como interruptor de config y como
+    caso base para verificar que el crossfade en sí es lo que cambia el
+    resultado, no la reestructuración del pipeline de audio).
+
+    Devuelve un único array numpy float32 (n_muestras, _CROSSFADE_CHANNELS).
+    """
+    import numpy as np
+
+    n = max(0, int(round(_CROSSFADE_SR * crossfade_ms / 1000)))
+    parts: list[np.ndarray] = []
+    pending_tail: "np.ndarray | None" = None
+
+    for path in fragment_paths:
+        audio = _decode_audio_float32(path)
+        if pending_tail is None:
+            if n > 0 and len(audio) > n:
+                parts.append(audio[:-n])
+                pending_tail = audio[-n:]
+            else:
+                pending_tail = audio
+            continue
+
+        this_n = min(n, len(pending_tail), len(audio))
+        if this_n > 0:
+            t = np.linspace(0.0, np.pi / 2, this_n, dtype=np.float32).reshape(-1, 1)
+            fade_out = np.cos(t)
+            fade_in = np.sin(t)
+            blended = pending_tail[-this_n:] * fade_out + audio[:this_n] * fade_in
+            if len(pending_tail) > this_n:
+                parts.append(pending_tail[:-this_n])
+            parts.append(blended)
+            remainder = audio[this_n:]
+        else:
+            # uno de los dos lados no tiene muestras que ofrecer (fragmento
+            # vacío tras un recorte degenerado) -- no hay nada que
+            # mezclar, se concatena sin crossfade en este punto concreto.
+            parts.append(pending_tail)
+            remainder = audio
+
+        if n > 0 and len(remainder) > n:
+            parts.append(remainder[:-n])
+            pending_tail = remainder[-n:]
+        else:
+            pending_tail = remainder
+
+    if pending_tail is not None:
+        parts.append(pending_tail)
+
+    if not parts:
+        return np.zeros((0, _CROSSFADE_CHANNELS), dtype=np.float32)
+    return np.concatenate(parts, axis=0)
+
+
+def _write_crossfaded_audio(
+    fragment_paths: list[Path], crossfade_ms: float, target_duration_s: float, out_wav_path: Path
+) -> None:
+    """
+    Escribe el resultado de _equal_power_crossfade_concat como WAV
+    (intermedio sin pérdida), reestirado a `target_duration_s` exactos
+    (ver _resample_to_length) para que quede sample-exacto con la
+    duración real del vídeo ya concatenado -- sin este paso el audio
+    quedaría más corto por el acortamiento inherente del crossfade en
+    cada empalme (ver _resample_to_length).
+    """
+    import soundfile as sf
+
+    audio = _equal_power_crossfade_concat(fragment_paths, crossfade_ms)
+    target_length = round(target_duration_s * _CROSSFADE_SR)
+    audio = _resample_to_length(audio, target_length)
+    sf.write(str(out_wav_path), audio, _CROSSFADE_SR, subtype="FLOAT")
+
+
+def _resample_to_length(audio: "np.ndarray", target_length: int) -> "np.ndarray":
+    """
+    Estira/comprime `audio` (n_muestras, canales) a EXACTAMENTE
+    `target_length` muestras mediante interpolación lineal.
+
+    Por qué hace falta (consecuencia matemática ineludible de cualquier
+    crossfade real, no un error): cada crossfade de `crossfade_ms` funde
+    2 tramos de N muestras "distintas" (N del final del primero + N del
+    principio del segundo) en solo N muestras de salida -- eso ACORTA el
+    audio combinado en N muestras por cada empalme, por construcción
+    (es literalmente lo que hace un crossfade: solapar contenido en vez
+    de concatenarlo seco). El VÍDEO, sin embargo, NO se acorta (sigue
+    concatenado tal cual, sin crossfade, tal y como se pide). Sin
+    corregir esto, el audio quedaría cada vez más "adelantado" respecto
+    al vídeo a medida que se acumulan empalmes (varios segundos en una
+    grabación de 1-2h con cientos de cortes) -- un desincronismo
+    progresivo real, no cosmético, que además rompería la calibración de
+    subtítulos (que asume que la deriva es la de redondeo de keyframes ya
+    documentada, mucho más pequeña).
+
+    Se corrige con un ÚNICO estiramiento global e imperceptible al final
+    (en vez de complicar cada empalme individualmente para que no
+    acorte nada): la magnitud típica es un cambio de velocidad de audio
+    de bastante menos del 1% (p.ej. ~12s repartidos en ~5800s de
+    contenido en una grabación real de referencia, ~0.2%) -- muy por
+    debajo del umbral perceptible de cambio de tempo/tono en audio
+    hablado (referencia habitual: 2-5%), así que una interpolación lineal
+    simple (sin librerías de time-stretch con preservación de tono) es
+    suficiente, no introduce artefactos audibles a esta escala.
+    """
+    import numpy as np
+
+    if len(audio) == 0 or target_length <= 0 or len(audio) == target_length:
+        return audio
+    old_idx = np.linspace(0.0, 1.0, num=len(audio), endpoint=True)
+    new_idx = np.linspace(0.0, 1.0, num=target_length, endpoint=True)
+    stretched = np.empty((target_length, audio.shape[1]), dtype=np.float32)
+    for ch in range(audio.shape[1]):
+        stretched[:, ch] = np.interp(new_idx, old_idx, audio[:, ch]).astype(np.float32)
+    return stretched
+
+
+def _replace_audio_track(video_path: Path, wav_path: Path, out_path: Path) -> None:
+    """
+    Combina el VÍDEO de `video_path` (sin recodificar, `-c:v copy`) con el
+    AUDIO de `wav_path` (recodificado a AAC, único punto de todo el
+    pipeline de audio-crossfade que pasa por un códec con pérdida --
+    justo antes de esto todo ha sido PCM/WAV sin pérdida, así que el
+    crossfade en sí y la concatenación de N fragmentos no acumulan
+    generaciones de recodificación con pérdida).
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(video_path), "-i", str(wav_path),
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac", "-ar", str(_CROSSFADE_SR), "-ac", str(_CROSSFADE_CHANNELS), "-b:a", "192k",
+        "-shortest",
+        str(out_path),
+    ]
+    _run_ffmpeg(cmd, description="Sustituyendo el audio por la versión con micro-crossfade en los empalmes")
+
+
 def _cut_video(
-    input_path: Path, keep_segments: list[tuple[float, float]], fps: float, out_dir: Path
+    input_path: Path, keep_segments: list[tuple[float, float]], fps: float, out_dir: Path,
+    audio_crossfade_ms: float = 0.0,
 ) -> Path:
     """
     Recorta `keep_segments` de `input_path` aplicando "renderizado
@@ -954,6 +1245,13 @@ def _cut_video(
     interior (`-frames:v`, ver _cut_segment_copy) -- necesario porque
     `-to` en modo -c copy no es fiable como límite superior cuando hay
     B-frames.
+
+    `audio_crossfade_ms` > 0 (ver "Micro-crossfade en los empalmes de
+    audio" en el docstring del módulo) sustituye el AUDIO del resultado
+    por una versión con crossfade equal-power en CADA unión entre
+    fragmentos -- el vídeo se sigue concatenando exactamente igual (sin
+    crossfade, ver _glue_video_files). <= 0 desactiva el crossfade
+    (comportamiento idéntico al de antes de esta función existir).
 
     Returns:
         Ruta al vídeo ya cortado, sin zoom (data/output/<video_id>/_cuts.mp4).
@@ -989,10 +1287,28 @@ def _cut_video(
     cut_path = out_dir / "_cuts.mp4"
     if len(segment_paths) == 1:
         shutil.move(str(segment_paths[0]), str(cut_path))
-    else:
-        _glue_video_files(segment_paths, cut_path)
-        for p in segment_paths:
-            Path(p).unlink(missing_ok=True)
+        return cut_path
+
+    _glue_video_files(segment_paths, cut_path)
+
+    if audio_crossfade_ms > 0:
+        t_cf = time.monotonic()
+        logger.info(
+            "Aplicando micro-crossfade de audio (%.0fms, equal-power) en %d unión(es) entre fragmentos...",
+            audio_crossfade_ms, len(segment_paths) - 1,
+        )
+        target_duration = _video_info(cut_path)["duration"]
+        wav_path = out_dir / "_cuts_crossfade_audio.wav"
+        _write_crossfaded_audio(segment_paths, audio_crossfade_ms, target_duration, wav_path)
+        crossfaded_path = out_dir / "_cuts_crossfade.mp4"
+        _replace_audio_track(cut_path, wav_path, crossfaded_path)
+        wav_path.unlink(missing_ok=True)
+        cut_path.unlink(missing_ok=True)
+        cut_path = crossfaded_path
+        logger.info("Crossfade de audio aplicado en %.1fs", time.monotonic() - t_cf)
+
+    for p in segment_paths:
+        Path(p).unlink(missing_ok=True)
     return cut_path
 
 
@@ -1149,6 +1465,17 @@ def apply_cuts_with_zoom(video_id: str, cuts: list[dict], config: dict) -> str:
     info = _video_info(input_path)
     duration, width, height = info["duration"], info["width"], info["height"]
 
+    min_kept_segment_seconds = float(config.get("edit", {}).get("min_kept_segment_seconds", 0.6))
+    merged_cuts = merge_short_kept_segments(cuts, min_kept_segment_seconds)
+    if len(merged_cuts) < len(cuts):
+        logger.info(
+            "Fusionados %d corte(s) cuyo tramo conservado entre sí era más corto que "
+            "min_kept_segment_seconds=%.2fs (%d -> %d corte(s)); ver 'Fusión de cortes con hueco "
+            "mínimo insuficiente' en el docstring del módulo.",
+            len(cuts) - len(merged_cuts), min_kept_segment_seconds, len(cuts), len(merged_cuts),
+        )
+    cuts = merged_cuts
+
     keep_segments = compute_keep_segments(cuts, duration)
     if not keep_segments:
         raise ValueError(
@@ -1176,7 +1503,8 @@ def apply_cuts_with_zoom(video_id: str, cuts: list[dict], config: dict) -> str:
         logger.info("No se ha detectado ningún tramo de habla continua; no se aplicará zoom.")
 
     out_dir = _output_dir(video_id, config)
-    cut_path = _cut_video(input_path, keep_segments, info["fps"], out_dir)
+    audio_crossfade_ms = float(config.get("edit", {}).get("audio_crossfade_ms", 20.0))
+    cut_path = _cut_video(input_path, keep_segments, info["fps"], out_dir, audio_crossfade_ms)
     result_path = _apply_zoom(cut_path, speech_segments, config, width, height)
 
     return str(result_path)

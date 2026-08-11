@@ -132,7 +132,7 @@ from pathlib import Path
 
 from src.common import db
 from src.common.config import REPO_ROOT, load_config
-from src.common.timeline import map_to_edited_timeline
+from src.common.timeline import map_to_edited_timeline, merge_short_kept_segments
 from src.common.transcription import transcribe_file
 
 logger = logging.getLogger(__name__)
@@ -577,6 +577,18 @@ def run(video_id: str, config: dict) -> dict:
     cuts_path = _cuts_path(video_id, config)
     with open(cuts_path, "r", encoding="utf-8") as f:
         cuts = json.load(f)
+    # Misma fusión de cortes con hueco mínimo insuficiente que aplica
+    # edit/run.py (ver "Fusión de cortes con hueco mínimo insuficiente" en
+    # su docstring) -- imprescindible aplicarla AQUÍ también: si
+    # edit/run.py fusiona cortes al recortar pero subtitles/ remapea
+    # contra el cuts.json SIN fusionar, la calibración de deriva de este
+    # módulo (ver más abajo) compararía una duración nominal que ya no
+    # corresponde a lo que edit/ realmente cortó, introduciendo un
+    # desajuste de sincronización real (no solo el redondeo de frames que
+    # esa calibración ya corrige). Ambos módulos leen el mismo
+    # config['edit']['min_kept_segment_seconds'] para no divergir.
+    min_kept_segment_seconds = float(config.get("edit", {}).get("min_kept_segment_seconds", 0.6))
+    cuts = merge_short_kept_segments(cuts, min_kept_segment_seconds)
 
     duration = float(
         transcript.get("duration_s")

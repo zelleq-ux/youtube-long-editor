@@ -70,6 +70,22 @@ edit:
   loudnorm: true
   prepend_intro: true      # antepone data/output/<video_id>/intro.mp4 (si existe) al principio del vídeo final
   append_outro: true
+  min_kept_segment_seconds: 0.6    # si el tramo conservado ENTRE dos cortes consecutivos es más corto que esto,
+                                    # se funden ambos cortes (absorbiendo también ese tramo) en vez de dejarlo
+                                    # como una isla de audio casi imperceptible -- reduce la densidad de empalmes
+                                    # sin tocar la sensibilidad de detección (silence_min_seconds/motion_threshold
+                                    # siguen igual). Valor elegido con datos reales de witchfire_1 (ver
+                                    # status.md/edit/run.py): hasta 0.5s TODOS los tramos afectados en todo el
+                                    # vídeo estaban vacíos (0 palabras transcritas perdidas); en 0.6s se pierde una
+                                    # única palabra suelta ("Ahora") a cambio de capturar la única isla realmente
+                                    # vacía de la ventana investigada. 0 desactiva la fusión por completo.
+  audio_crossfade_ms: 20           # crossfade de audio equal-power (curva coseno/seno, NO lineal -- evita el
+                                    # bajón de volumen perceptible de un crossfade lineal) aplicado en CADA punto
+                                    # de unión entre fragmentos de vídeo al cortar (tanto interior-copiado como
+                                    # recodificación completa), para suavizar el "ametrallado" de tener muchos
+                                    # empalmes seguidos -- ver "Micro-crossfade en los empalmes de audio" en el
+                                    # docstring de edit/run.py. Solo afecta al AUDIO (el vídeo se sigue
+                                    # concatenando sin recodificar, sin crossfade). 0 desactiva el crossfade.
 
 thumbnail:
   enabled: true                    # extraer frames candidatos automáticamente; si es false, run() no hace nada (avisa en el log)

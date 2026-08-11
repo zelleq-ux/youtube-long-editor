@@ -99,6 +99,64 @@ durante esta misma investigación) en el docstring de `src/edit/run.py`
 ningún vídeo ya publicado -- el fix es solo para próximas ediciones.
 Diagnóstico y fix confirmados por el usuario, comiteados.
 
+**Bug de "microcortes" en witchfire_1 investigado y arreglado (2026-08-12),
+reportado tras publicar ese vídeo con el fix de arriba ya aplicado:**
+entre 56:00-57:52 de `final.mp4` sonaban muchos cortes seguidos "en
+ametralladora" en un tramo de lectura continua (el narrador del juego
+leyendo una carta). Investigado a fondo con datos reales antes de tocar
+código: la forma de onda no mostraba discontinuidades objetivas en las
+costuras (cada corte técnicamente limpio, confirmado también que el fix
+de solape de audio de arriba seguía funcionando bien ahí), pero la
+densidad de cortes en esa ventana era ~2.8-5.2x la media del vídeo (22
+cortes en ~170s vs. 1 cada 21.7s de media) -- no por sobre-detección de
+"pausas de lectura" como silencio (el usuario quería mantener ESE
+dinamismo intacto), sino porque encadenar tantos empalmes técnicamente
+correctos y muy próximos entre sí suena mal EN CONJUNTO, aunque cada uno
+por separado esté bien.
+
+Dos mejoras, ambas en `_glue_video_files`/`_cut_video`/`apply_cuts_with_zoom`
+(`src/edit/run.py`) + `src/common/timeline.py`, sin tocar
+`silence_min_seconds` ni ninguna sensibilidad de detección:
+
+1. **`merge_short_kept_segments`** (nueva, `src/common/timeline.py`):
+   funde dos cortes consecutivos si el tramo conservado entre ellos es
+   más corto que `config['edit']['min_kept_segment_seconds']` (0.6s por
+   defecto -- valor elegido con datos reales de witchfire_1: hasta 0.5s
+   TODOS los tramos afectados en todo el vídeo estaban vacíos de
+   palabras transcritas, 0.6s solo sacrifica una palabra suelta
+   ("Ahora") a cambio de capturar la única isla realmente vacía de la
+   ventana investigada). Aplicada también en `subtitles/run.py` (mismo
+   umbral) para que su calibración de deriva contra `final.mp4` no se
+   desincronice respecto a lo que `edit/` realmente corta; NO aplicada en
+   `detect_chapters/` (tolerancia de 120s por capítulo, la precisión no
+   importa ahí).
+2. **Micro-crossfade de audio equal-power** (`audio_crossfade_ms=20` por
+   defecto, curva coseno/seno -- el mismo estándar que implementa
+   `acrossfade curve=qsin` de ffmpeg) en CADA unión entre fragmentos al
+   cortar, tanto interior-copiado como recodificación completa -- el
+   vídeo se sigue concatenando exactamente igual, sin crossfade. Implementado
+   en NumPy sobre PCM decodificado (no encadenando el filtro `acrossfade`
+   de ffmpeg: mismo riesgo de escala ya documentado para el filtro
+   `concat` con cientos de fragmentos, y evita acumular generaciones de
+   pérdida AAC si se hiciera en varias pasadas). Un crossfade acorta el
+   audio combinado por construcción (solapar contenido en vez de
+   concatenarlo seco); sin corregirlo, el audio se habría ido
+   desincronizando progresivamente del vídeo a lo largo del vídeo
+   (varios segundos acumulados en una grabación de 1-2h) -- corregido con
+   un único reestiramiento global e imperceptible (~0.2% típico,
+   `_resample_to_length`) al final, para que el audio quede sample-exacto
+   con la duración real del vídeo ya concatenado.
+
+Validado con fragmentos REALES de witchfire_1 (no solo sintéticos, ver
+`tests/test_merge_short_kept_segments.py` y `tests/test_audio_crossfade.py`
+nuevos) y con el test de escala completo (1h/400 cortes, merge+crossfade
+ya activados por defecto) -- sin discontinuidades de PTS ni desajuste de
+duración audio/vídeo. Clips ANTES/DESPUÉS de la ventana reportada
+generados con las funciones reales de producción sobre el `raw.mp4` real
+(no el `final.mp4` ya publicado) y confirmados de oído por el usuario:
+"suena mucho mejor, más suave". No se ha tocado ningún vídeo ya
+publicado. Comiteado en local, pendiente de push (decisión del usuario).
+
 Un bloqueo pendiente, no trabajo pendiente de implementación:
 
 1. **Confirmación explícita para la primera subida real a YouTube:**
