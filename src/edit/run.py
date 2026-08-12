@@ -1041,6 +1041,18 @@ def _glue_video_files(paths: list[Path], out_path: Path) -> None:
 _CROSSFADE_SR = 48000
 _CROSSFADE_CHANNELS = 2
 
+# El bucle de decodificación de _equal_power_crossfade_concat lanza un
+# proceso ffmpeg por fragmento (pueden ser cientos en una grabación larga)
+# sin ninguna otra señal de progreso -- en una ejecución real contra un
+# vídeo de ~1h44m/706 fragmentos esto se quedó en silencio el tiempo
+# suficiente para que el proceso en background fuera matado externamente
+# (mismo síntoma ya documentado para cv2.VideoCapture/librosa: una llamada
+# bloqueante larga sin ninguna salida se interpreta como colgada). Log de
+# progreso periódico, mismo patrón que compute_motion_timeseries en
+# detect_cuts (cada N fragmentos O cada M segundos, lo que llegue antes).
+_CROSSFADE_PROGRESS_EVERY_FRAGMENTS = 50
+_CROSSFADE_PROGRESS_EVERY_SECONDS = 10.0
+
 
 def _decode_audio_float32(path: Path) -> "np.ndarray":
     """
@@ -1096,8 +1108,20 @@ def _equal_power_crossfade_concat(fragment_paths: list[Path], crossfade_ms: floa
     parts: list[np.ndarray] = []
     pending_tail: "np.ndarray | None" = None
 
-    for path in fragment_paths:
+    total = len(fragment_paths)
+    inicio = time.monotonic()
+    ultimo_log = inicio
+
+    for i, path in enumerate(fragment_paths, start=1):
         audio = _decode_audio_float32(path)
+
+        ahora = time.monotonic()
+        if i % _CROSSFADE_PROGRESS_EVERY_FRAGMENTS == 0 or (ahora - ultimo_log) >= _CROSSFADE_PROGRESS_EVERY_SECONDS or i == total:
+            logger.info(
+                "Progreso crossfade de audio: %d/%d fragmento(s) decodificado(s), %.1fs transcurridos",
+                i, total, ahora - inicio,
+            )
+            ultimo_log = ahora
         if pending_tail is None:
             if n > 0 and len(audio) > n:
                 parts.append(audio[:-n])

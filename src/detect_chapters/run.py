@@ -89,12 +89,15 @@ from src.common.timeline import compute_keep_segments, map_to_edited_timeline
 
 logger = logging.getLogger(__name__)
 
-# Respuesta no-streaming: de sobra para una lista de capítulos (salida
-# pequeña) incluso con el pensamiento adaptativo de Sonnet 5 activo por
-# defecto (cuenta como parte de max_tokens). Muy por debajo del umbral al
-# que el SDK exige streaming para evitar timeouts HTTP (~16000 sin
-# streaming).
-_MAX_TOKENS = 8000
+# Respuesta no-streaming: por debajo del umbral al que el SDK exige
+# streaming para evitar timeouts HTTP (~16000 sin streaming), pero con
+# margen generoso para el pensamiento adaptativo de Sonnet 5 activo por
+# defecto (cuenta como parte de max_tokens). Subido de 8000 a 15000
+# (2026-08-12) tras un fallo real (stop_reason=max_tokens,
+# parsed_output=None) contra shift_at_midnight_2 -- el vídeo más largo
+# procesado hasta ahora (6228s originales) generó más pensamiento/capítulos
+# de los que cabían en el presupuesto anterior.
+_MAX_TOKENS = 15000
 
 _GENERIC_INTRO_TITLE = "Introducción"
 
