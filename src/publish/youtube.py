@@ -127,6 +127,17 @@ _THUMBNAIL_JPEG_QUALITY_STEPS = (95, 90, 85, 80, 70, 60, 50, 40, 30)
 _UPLOAD_RETRIABLE_STATUS_CODES = (500, 502, 503, 504)
 _UPLOAD_MAX_RETRIES = 10
 
+# MediaFileUpload(chunksize=-1) sube el archivo ENTERO en una única llamada
+# bloqueante a next_chunk(), sin ninguna salida hasta que termina -- para un
+# final.mp4 real de varios GB eso puede tardar bastante y coincide
+# exactamente con el patrón que ya hizo que un proceso en background fuera
+# matado externamente esta misma sesión (ver status.md, fila `edit`:
+# cualquier llamada bloqueante larga sin log intermedio corre ese riesgo).
+# Subir en trozos de tamaño fijo (múltiplo de 256KiB, requisito de la API)
+# permite loguear progreso entre llamadas a next_chunk() -- ver
+# _execute_resumable_upload.
+_UPLOAD_CHUNK_SIZE_BYTES = 50 * 1024 * 1024
+
 
 def _output_dir(video_id: str, config: dict) -> Path:
     return (REPO_ROOT / config["paths"]["output"]).resolve() / video_id
@@ -394,7 +405,15 @@ def _execute_resumable_upload(insert_request: HttpRequest) -> dict:
     retry = 0
     while response is None:
         try:
-            _status, response = insert_request.next_chunk()
+            status, response = insert_request.next_chunk()
+            if status is not None:
+                logger.info(
+                    "Progreso de subida: %.1f%% (%.0fMB/%.0fMB)",
+                    status.progress() * 100,
+                    status.resumable_progress / 1024 / 1024,
+                    status.total_size / 1024 / 1024,
+                )
+            retry = 0
         except HttpError as exc:
             if exc.resp.status not in _UPLOAD_RETRIABLE_STATUS_CODES:
                 raise
@@ -470,7 +489,9 @@ def run(
     youtube = youtube_service if youtube_service is not None else _build_youtube_service(config)
     channel_name = _verify_channel(youtube, config)
 
-    media = MediaFileUpload(str(video_path), mimetype="video/mp4", chunksize=-1, resumable=True)
+    media = MediaFileUpload(
+        str(video_path), mimetype="video/mp4", chunksize=_UPLOAD_CHUNK_SIZE_BYTES, resumable=True
+    )
     insert_request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
 
     result = {

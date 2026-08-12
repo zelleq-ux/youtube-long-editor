@@ -65,6 +65,7 @@ import cv2
 import httplib2
 import numpy as np
 from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaUploadProgress
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -108,9 +109,15 @@ class _FakeInsertRequest:
 
     def next_chunk(self):
         self.next_chunk_calls += 1
+        # MediaUploadProgress real (no un dict) -- _execute_resumable_upload
+        # llama a status.progress() y lee resumable_progress/total_size, el
+        # mismo contrato que expone la librería real en cada next_chunk().
+        status = MediaUploadProgress(
+            self.next_chunk_calls * 10, self._chunks_before_done * 10
+        )
         if self.next_chunk_calls < self._chunks_before_done:
-            return {"progress": self.next_chunk_calls}, None
-        return {"progress": 1.0}, self._final_response
+            return status, None
+        return status, self._final_response
 
 
 class _FakeThumbnailSetRequest:
@@ -409,7 +416,7 @@ def main() -> int:
                     attempts["count"] += 1
                     if attempts["count"] < 3:
                         raise HttpError(httplib2.Response({"status": 503}), b"transient")
-                    return {"progress": 1.0}, {"id": "recovered_after_retries"}
+                    return MediaUploadProgress(10, 10), {"id": "recovered_after_retries"}
 
             response = _execute_resumable_upload(_FlakyRequest())
             check(
