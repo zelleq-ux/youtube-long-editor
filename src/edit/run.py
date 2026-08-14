@@ -448,11 +448,11 @@ filtro `concat` más arriba ("Fuga de frames de vídeo..."); y hacerlo en
 múltiples pasadas de ffmpeg con AAC como formato intermedio acumularía
 generaciones de recodificación con pérdida en el audio que participa de
 varios crossfades seguidos. En su lugar (`_decode_audio_float32`,
-`_equal_power_crossfade_concat`, `_write_crossfaded_audio` en este
-módulo), el audio de cada fragmento se decodifica a PCM/NumPy (barato:
-audio, no vídeo), se funde con la curva equal-power en Python, y solo se
-recodifica a AAC UNA vez al final -- todo el proceso intermedio es sin
-pérdida.
+`_decode_fragment_groups`, `_local_crossfade_concat`,
+`_write_crossfaded_audio` en este módulo), el audio de cada fragmento se
+decodifica a PCM/NumPy (barato: audio, no vídeo), se funde con la curva
+equal-power en Python, y solo se recodifica a AAC UNA vez al final -- todo
+el proceso intermedio es sin pérdida.
 
 Corrección de duración (`_resample_to_length`): un crossfade de N
 muestras acorta el audio combinado en N muestras por cada unión --
@@ -461,16 +461,17 @@ concatenarlo seco (es literalmente lo que hace un crossfade). El vídeo,
 sin embargo, no se acorta (se pidió explícitamente que no llevara
 crossfade). Sin corregir esto, el audio se habría ido desincronizando
 PROGRESIVAMENTE del vídeo a lo largo de todo el vídeo (varios segundos
-acumulados en una grabación de 1-2h con cientos de cortes) -- se corrige
-con un único reestiramiento global e imperceptible al final (~0.2% típico
-en una grabación real, muy por debajo del umbral perceptible de cambio de
-tempo en audio hablado, ~2-5%), interpolación lineal simple (no hace
-falta una librería de time-stretch con preservación de tono a esta
-escala), para que el audio quede sample-exacto con la duración real del
-vídeo ya concatenado. Validado explícitamente contra el test de escala
-completo (1h/400 cortes, ver scale_test_edit_pipeline.py) con
-merge+crossfade ya activados por defecto: sin discontinuidades de PTS ni
-desajuste de duración audio/vídeo.
+acumulados en una grabación de 1-2h con cientos de cortes). La primera
+versión de esta corrección era un ÚNICO reestiramiento GLOBAL al final
+(~0.2% típico en una grabación real) -- ver "Reestirado LOCAL en vez de
+global" más abajo para por qué esto resultó ser insuficiente en la
+práctica (aunque imperceptible en aislado, un único factor global no
+puede seguir una distribución de cortes reales no uniforme) y se
+sustituyó por un reestiramiento LOCAL, por `keep_segment`, que es el
+mecanismo actual. Validado explícitamente contra el test de escala
+completo (1h/varios cientos de cortes, ver scale_test_edit_pipeline.py)
+con merge+crossfade ya activados por defecto: sin discontinuidades de PTS
+ni desajuste de duración audio/vídeo.
 
 Validado con fragmentos REALES de witchfire_1 (no solo sintéticos, ver
 tests/test_merge_short_kept_segments.py y tests/test_audio_crossfade.py):
@@ -481,6 +482,167 @@ audible. Clips ANTES/DESPUÉS de la ventana reportada, generados con estas
 mismas funciones de producción sobre el `raw.mp4` real (no el
 `final.mp4` ya publicado), confirmados de oído por el usuario. No se ha
 tocado ningún vídeo ya publicado.
+
+Fronteras internas espurias del renderizado parcial sin pérdida (bug de
+desincronización audio/vídeo, encontrado 2026-08-12, arreglado
+2026-08-14): la primera versión de este mecanismo aplicaba el crossfade
+en TODAS las fronteras de `segment_paths`, sin distinguir las fronteras
+REALES (entre dos `keep_segments` distintos, un corte de verdad) de las
+fronteras INTERNAS que `_cut_segment_smart` introduce solo para poder
+copiar sin recodificar el interior de un mismo tramo (head/mid/tail, ver
+"Renderizado parcial sin pérdida" más arriba) -- ahí no hay ningún corte
+real, es contenido continuo dividido en varios archivos solo por
+rendimiento, y además ya sample-exacto en esa costura gracias al fix de
+solape de audio de más arriba. Tratar cada frontera interna como si fuera
+real acortaba el audio otros `crossfade_ms` de más sin que hubiera
+ninguna discontinuidad que justificara solaparla; medido contra
+`shift_at_midnight_2` (348 cortes, 706 fragmentos): de las 705 fronteras
+totales, solo 333 eran cortes reales, 372 eran fronteras internas
+espurias. `_resample_to_length` seguía corrigiendo la duración TOTAL
+correctamente (su objetivo es siempre la duración real medida del vídeo
+ya concatenado, no un cálculo derivado del nº de fronteras), pero ese
+acortamiento de más estaba repartido de forma muy desigual por la línea
+de tiempo (las fronteras internas espurias no se distribuyen
+uniformemente -- dependen de cuántos keyframes caen dentro de cada tramo
+concreto), así que el reestiramiento uniforme final corregía la duración
+AGREGADA sin corregir el desincronismo LOCAL en cada punto -- por eso
+ninguna comprobación de duración total o continuidad de PTS lo detectaba
+(ver tests/scale_test_edit_pipeline.py más abajo para el nuevo test que
+sí lo detecta).
+
+Fix: `_cut_video` construye ahora `boundary_is_real` (lista paralela a
+las fronteras de `segment_paths`, `True` únicamente en la frontera entre
+el último fragmento de un `keep_segment` y el primero del siguiente) y la
+pasa a través de `_write_crossfaded_audio` hasta `_decode_fragment_groups`
+(que agrupa los fragmentos por `keep_segment` usando exactamente esta
+lista) y `_local_crossfade_concat` (que aplica el crossfade equal-power
+SOLO entre grupos, es decir, SOLO en fronteras reales; dentro de un mismo
+grupo el audio ya llega concatenado en seco desde `_decode_fragment_groups`,
+sin crossfade, sin acortar nada). Al reducirse el nº de crossfades
+realmente aplicados (333 en vez de 705 en el caso real), el acortamiento
+total a corregir se reduce en la misma proporción.
+
+Reestirado LOCAL en vez de global (segundo bug de desincronización,
+encontrado 2026-08-14 revalidando el fix anterior contra
+`shift_at_midnight_2` real -- ver status.md para el detalle completo de
+la investigación): el fix de fronteras internas de arriba es necesario
+pero, se descubrió, NO suficiente por sí solo para bajar el desincronismo
+local a escala de ruido de ASR (~50-100ms) en un vídeo real. Medido con
+un método de localización de contenido limpio (sin pasar por
+`cuts.json` ni por subtítulos -- se busca directamente el frame/audio
+real de `data/raw/<id>.mp4` dentro de `final.mp4` por coincidencia de
+contenido, así que no hereda ninguna deriva de cálculo de timestamps):
+incluso con las fronteras internas ya arregladas, `shift_at_midnight_2`
+seguía mostrando hasta ~1.05s de desfase local en la zona 46-55% del
+vídeo (vs. ~1.5s con el bug de fronteras internas sin arreglar en esa
+misma zona -- el primer fix SÍ ayuda, ~250-475ms según el punto, pero no
+basta).
+
+Causa: incluso aplicando el crossfade SOLO en fronteras reales (ya
+corregido), `_resample_to_length` seguía aplicándose una única vez,
+GLOBALMENTE, sobre el audio ya cruzado -- una única tasa de estiramiento
+calculada con la duración TOTAL. Esto es matemáticamente exacto en
+AGREGADO (la suma cuadra siempre, por construcción), pero los cortes
+REALES de una grabación real NO están uniformemente distribuidos (rachas
+de cortes seguidos en tramos de acción/lectura rápida, huecos largos en
+tramos de habla continua -- confirmado con `cuts.json` real de
+`shift_at_midnight_2`, y reproducido con una simulación analítica pura
+-- sin renderizar nada -- del propio mecanismo de reestirado contra ese
+mismo `cuts.json`, que predice la MISMA forma no monótona con la MISMA
+magnitud que la medición real, incluida una coincidencia casi exacta en
+el punto ~95%). Una tasa global termina "prestando" corrección de zonas
+con pocos cortes reales a zonas con muchos, y viceversa -- el mismo tipo
+de error, a menor escala, que el propio bug de fronteras internas de
+arriba (una corrección UNIFORME para un acortamiento distribuido de
+forma NO uniforme).
+
+Fix: `_local_crossfade_concat` ya no hace un único reestiramiento global.
+Cada `keep_segment`, justo después de aplicar su crossfade con el
+siguiente, se reestira INDIVIDUALMENTE de vuelta a su propia longitud
+EXACTA -- el acortamiento se corrige exactamente DONDE ocurrió, nunca
+repartido sobre el resto del vídeo. `_write_crossfaded_audio` conserva
+una única llamada final a `_resample_to_length` sobre el resultado ya
+localmente corregido, pero como red de seguridad para una discrepancia
+ya minúscula -- no como mecanismo principal.
+
+Vídeo más largo que audio en cada recodificación (TERCER bug de
+desincronización, encontrado 2026-08-14 revalidando el fix anterior --
+ver status.md para el detalle completo de la investigación, incluida la
+medición directa contra fragmentos reales de `shift_at_midnight_2` que lo
+confirmó): el fix de reestirado local de arriba usaba, como longitud
+"correcta" a la que devolver cada `keep_segment`, la longitud con la que
+el AUDIO de ese tramo se había extraído (`len(group)` en
+`_decode_fragment_groups`) -- una elección razonable en apariencia (es la
+duración real de ESE audio, sin crossfade de por medio), pero que resultó
+estar sistemáticamente sesgada: medido con fragmentos reales
+(`_cut_segment_smart`/`_cut_segment_recode` de producción, sin ningún
+crossfade ni resample de por medio), el VÍDEO de un mismo tramo recodificado
+sale sistemáticamente MÁS LARGO que su AUDIO -- entre ~5 y ~26ms más en
+los casos medidos, SIEMPRE en la misma dirección -- porque `-ss`/`-to`
+antes de `-i` en una recodificación redondea el arranque/fin del VÍDEO a
+un límite de FRAME (~16.7ms de granularidad a 60fps), mientras que el
+AUDIO, con una granularidad de muestra (~0.02ms), no necesita ese
+redondeo y sale prácticamente exacto al nominal. Usar la longitud del
+audio como objetivo, por tanto, NO corregía esta discrepancia -- solo
+disimulaba el acortamiento del crossfade. Esta discrepancia video-vs-audio
+es proporcionalmente MUCHO mayor en tramos CORTOS (recodificados
+enteros, sin interior copiado -- toda su duración carga con el sesgo) que
+en tramos largos (solo sus bordes recodificados cargan con el sesgo, el
+interior copiado es bit-exacto), así que se concentra precisamente en las
+zonas con más tramos cortos seguidos -- confirmado como la causa real de
+un desfase de varios cientos de ms en una zona así de `shift_at_midnight_2`
+que el fix de reestirado local, por sí solo, reducía pero no eliminaba.
+
+Fix (primera versión, INSUFICIENTE por sí sola -- ver más abajo):
+`_cut_video` medía la duración REAL DEL VÍDEO de cada `keep_segment` en
+FRAMES sobre cada fragmento SIN UNIR (`_count_video_frames`, ffprobe
+-count_packets) dividido por `fps` (la tasa nominal declarada por el
+contenedor de entrada), y pasaba esas duraciones -- no las del audio
+extraído -- a `_local_crossfade_concat` como `target_lengths`. Mejoraba
+mucho el desfase real medido (de hasta ~1.5s a ~200-660ms según el
+punto), pero no lo eliminaba del todo.
+
+Redondeo del concat demuxer en el vídeo ya unido (causa real del
+desfase residual, encontrado 2026-08-15 investigando por qué el fix de
+arriba no bastaba -- ver status.md para el detalle completo, incluida la
+medición contra `shift_at_midnight_2` real): la sospecha inicial fue que
+`fps` NOMINAL (el declarado por el contenedor, p.ej. `r_frame_rate=60/1`
+exacto) no coincidía con la tasa REAL de la grabación -- descartado
+explícitamente: se midieron los PTS reales de `data/raw/<id>.mp4` en
+varias zonas (una con buen resultado, una con el desfase residual, otra
+con buen resultado) y las tres dieron exactamente 60.000000fps, sin
+ningún jitter de captura. La causa real, aislada reproduciendo el
+problema a pequeña escala con fragmentos reales: CADA FRAGMENTO
+individual (antes de unirlo a los demás) tiene metadata de duración
+exacta (verificado: 0.00ms de diferencia entre su propio `frames/fps` y
+su propia duración declarada, en 13 fragmentos reales comprobados) --
+pero el concat DEMUXER (`_glue_video_files`) introduce un pequeño
+redondeo de PTS en CADA UNIÓN al encadenar muchos fragmentos pequeños
+(confirmado con los PTS reales del archivo ya unido, no solo su duración
+declarada: la tasa implícita del PTS baja a ~59.97 SOLO después de unir,
+nunca antes). Esto es proporcional al Nº DE UNIONES, no al tiempo
+transcurrido ni a `fps` -- por eso se concentraba precisamente en las
+zonas con más cortes seguidos (más fragmentos, más uniones), exactamente
+donde el fix de arriba dejaba más desfase residual.
+
+Fix definitivo: en vez de calcular la duración de cada `keep_segment`
+como `frames/fps` sobre sus fragmentos SIN unir, `_cut_video` mide ahora
+su posición REAL en el vídeo YA UNIDO -- `_scan_video_pts(cut_path)` lista
+los PTS reales (ordenados por presentación) de TODO el archivo ya
+concatenado (ffprobe, solo demuxea, barato incluso en 1-2h), y
+`_group_video_durations_from_pts` calcula la duración de cada
+`keep_segment` como la diferencia entre el PTS de inicio del SIGUIENTE
+grupo y el de este grupo (o la duración total menos el PTS de inicio,
+para el último) -- captura CUALQUIER redondeo que el concat demuxer haya
+introducido, sea cual sea su causa exacta, porque mide directamente sobre
+el resultado real en vez de intentar predecirlo. La red de seguridad
+final de `_write_crossfaded_audio` (una medición INDEPENDIENTE de la
+duración total, no derivada de sumar `target_lengths`) se mantiene de
+todos modos: con este fix la suma de duraciones por PTS ya coincide con
+la duración total salvo por el PTS del primer frame (normalmente unos
+pocos ms, no segundos), así que vuelve a ser una red de seguridad
+genuinamente minúscula, no una corrección de magnitud apreciable como con
+el fix anterior.
 """
 from __future__ import annotations
 
@@ -822,6 +984,94 @@ def _scan_keyframe_timestamps(path: Path) -> list[float]:
     return keyframes
 
 
+def _count_video_frames(path: Path) -> int:
+    """
+    Cuenta los frames de la pista de vídeo de `path` sin decodificar
+    (solo demuxea paquetes, `ffprobe -count_packets`) -- barato, mismo
+    principio que _scan_keyframe_timestamps. Usado por _cut_video para
+    medir la duración de vídeo REAL (en frames, no en segundos con
+    redondeo de punto flotante) de cada fragmento, y así poder darle a
+    `_local_crossfade_concat` un objetivo de audio que coincida con el
+    VÍDEO real de ese fragmento -- ver "Vídeo más largo que audio en cada
+    recodificación" en el docstring del módulo para el porqué.
+    """
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+        "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0",
+        str(path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe falló contando frames de {path}:\n{result.stderr[-2000:]}")
+    return int(result.stdout.strip())
+
+
+def _scan_video_pts(path: Path) -> list[float]:
+    """
+    Lista ORDENADA (por tiempo de PRESENTACIÓN, no de aparición en el
+    archivo) de los PTS de todos los paquetes de la pista de vídeo de
+    `path` -- ffprobe, solo demuxea paquetes, sin decodificar, mismo
+    principio que _scan_keyframe_timestamps/_count_video_frames (barato
+    incluso en grabaciones de 1-2h). Usado por _cut_video para medir la
+    posición REAL de cada `keep_segment` en el vídeo YA UNIDO -- ver
+    "Redondeo del concat demuxer en el vídeo ya unido" en el docstring
+    del módulo para el porqué de necesitar esto en vez de fiarse de
+    `frames/fps` sobre los fragmentos SIN unir.
+    """
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "packet=pts_time", "-of", "csv=p=0",
+        str(path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe falló escaneando PTS de vídeo de {path}:\n{result.stderr[-2000:]}")
+    pts = [float(line) for line in result.stdout.splitlines() if line.strip()]
+    pts.sort()
+    return pts
+
+
+def _group_video_durations_from_pts(
+    frame_counts: list[int], real_boundary: list[bool], sorted_pts: list[float], total_duration_s: float
+) -> list[float]:
+    """
+    Agrupa `frame_counts` (uno por fragmento de VÍDEO, mismo orden y
+    mismo criterio de fronteras que `_decode_fragment_groups` -- ver ese
+    docstring) por `keep_segment`, y devuelve la duración REAL de cada
+    grupo tal y como quedó en el vídeo YA UNIDO: la diferencia entre el
+    PTS del primer frame del grupo SIGUIENTE y el PTS del primer frame de
+    ESTE grupo (o `total_duration_s` menos el PTS de inicio, para el
+    último grupo) -- `sorted_pts` debe venir de `_scan_video_pts(cut_path)`
+    (el archivo YA UNIDO), NO de fragmentos sin unir.
+
+    Por qué NO basta con `frames/fps` sobre los fragmentos sin unir
+    (encontrado 2026-08-15, ver "Redondeo del concat demuxer en el vídeo
+    ya unido" en el docstring del módulo): cada fragmento individual
+    tiene metadata de duración exacta (verificado: 0.00ms de diferencia
+    entre su propio `frames/fps` y su propia duración declarada), pero el
+    concat DEMUXER introduce un pequeño redondeo de PTS en cada UNIÓN al
+    encadenarlos -- proporcional al Nº DE UNIONES, no al tiempo
+    transcurrido, así que se concentra en tramos con muchos cortes
+    seguidos (muchos fragmentos cortos, y por tanto muchas uniones) en
+    vez de repartirse uniformemente. Medir la posición real en el archivo
+    YA UNIDO captura este efecto directamente, sea cual sea su causa
+    exacta -- no hace falta modelarlo.
+    """
+    durations: list[float] = []
+    cum_frames = 0
+    group_start_frame = 0
+    total = len(frame_counts)
+    for i, fc in enumerate(frame_counts):
+        cum_frames += fc
+        is_last = i == total - 1
+        if is_last or real_boundary[i]:
+            start_pts = sorted_pts[group_start_frame]
+            end_pts = sorted_pts[cum_frames] if cum_frames < len(sorted_pts) else total_duration_s
+            durations.append(end_pts - start_pts)
+            group_start_frame = cum_frames
+    return durations
+
+
 def _keyframe_at_or_after(keyframes: list[float], t: float) -> float | None:
     """Primer keyframe >= t de `keyframes` (ya ordenada), o None si no hay ninguno."""
     i = bisect.bisect_left(keyframes, t)
@@ -1041,7 +1291,7 @@ def _glue_video_files(paths: list[Path], out_path: Path) -> None:
 _CROSSFADE_SR = 48000
 _CROSSFADE_CHANNELS = 2
 
-# El bucle de decodificación de _equal_power_crossfade_concat lanza un
+# El bucle de decodificación de _decode_fragment_groups lanza un
 # proceso ffmpeg por fragmento (pueden ser cientos en una grabación larga)
 # sin ninguna otra señal de progreso -- en una ejecución real contra un
 # vídeo de ~1h44m/706 fragmentos esto se quedó en silencio el tiempo
@@ -1082,101 +1332,181 @@ def _decode_audio_float32(path: Path) -> "np.ndarray":
     return audio.reshape(-1, _CROSSFADE_CHANNELS)
 
 
-def _equal_power_crossfade_concat(fragment_paths: list[Path], crossfade_ms: float) -> "np.ndarray":
+def _decode_fragment_groups(fragment_paths: list[Path], real_boundary: list[bool]) -> list["np.ndarray"]:
     """
-    Decodifica el audio de cada fragmento de `fragment_paths` (en orden) y
-    los concatena aplicando un crossfade EQUAL-POWER (curva coseno/seno --
-    la misma curva que implementa el filtro `acrossfade` de ffmpeg con
-    `curve=qsin`, el estándar recomendado para crossfades cortos de voz:
-    mantiene la potencia percibida constante durante la transición,
-    a diferencia de un crossfade LINEAL que sí produce un bajón de volumen
-    perceptible en el punto medio) de `crossfade_ms` en CADA unión -- ver
-    "Micro-crossfade en los empalmes de audio" en el docstring del módulo
-    para el porqué y para por qué esto se implementa en numpy en vez de
-    encadenar el filtro `acrossfade` de ffmpeg.
+    Decodifica cada fragmento de `fragment_paths` (en orden) y los agrupa
+    por `keep_segment`: los fragmentos consecutivos separados por una
+    frontera INTERNA espuria (`real_boundary[i] is False`) se concatenan
+    en SECO (sin crossfade, mismo criterio que antes) en un único array
+    por grupo; cada frontera REAL (`True`) empieza un grupo nuevo. El
+    resultado es, para cada `keep_segment`, su audio COMPLETO tal cual se
+    extrajo (longitud exacta, sin ningún acortamiento todavía -- eso lo
+    aplica después `_local_crossfade_concat`).
 
-    `crossfade_ms` <= 0 desactiva el crossfade (concatenación directa,
-    sample a sample, sin mezcla -- útil como interruptor de config y como
-    caso base para verificar que el crossfade en sí es lo que cambia el
-    resultado, no la reestructuración del pipeline de audio).
-
-    Devuelve un único array numpy float32 (n_muestras, _CROSSFADE_CHANNELS).
+    Loguea progreso periódico (mismo motivo que antes: un proceso ffmpeg
+    de decodificación por fragmento, pueden ser cientos en una grabación
+    larga, sin esto se interpretó como colgado en producción -- ver
+    "Bug de fiabilidad... 2026-08-12" en el docstring del módulo).
     """
     import numpy as np
 
-    n = max(0, int(round(_CROSSFADE_SR * crossfade_ms / 1000)))
-    parts: list[np.ndarray] = []
-    pending_tail: "np.ndarray | None" = None
+    if len(real_boundary) != max(0, len(fragment_paths) - 1):
+        raise ValueError(
+            f"real_boundary debe tener {max(0, len(fragment_paths) - 1)} elemento(s) "
+            f"(uno por frontera entre fragmentos consecutivos), tiene {len(real_boundary)}"
+        )
+
+    groups: list[np.ndarray] = []
+    current: list[np.ndarray] = []
 
     total = len(fragment_paths)
     inicio = time.monotonic()
     ultimo_log = inicio
 
-    for i, path in enumerate(fragment_paths, start=1):
+    for i, path in enumerate(fragment_paths):
         audio = _decode_audio_float32(path)
+        current.append(audio)
 
         ahora = time.monotonic()
-        if i % _CROSSFADE_PROGRESS_EVERY_FRAGMENTS == 0 or (ahora - ultimo_log) >= _CROSSFADE_PROGRESS_EVERY_SECONDS or i == total:
+        if (i + 1) % _CROSSFADE_PROGRESS_EVERY_FRAGMENTS == 0 or (ahora - ultimo_log) >= _CROSSFADE_PROGRESS_EVERY_SECONDS or i + 1 == total:
             logger.info(
                 "Progreso crossfade de audio: %d/%d fragmento(s) decodificado(s), %.1fs transcurridos",
-                i, total, ahora - inicio,
+                i + 1, total, ahora - inicio,
             )
             ultimo_log = ahora
-        if pending_tail is None:
-            if n > 0 and len(audio) > n:
-                parts.append(audio[:-n])
-                pending_tail = audio[-n:]
-            else:
-                pending_tail = audio
-            continue
 
-        this_n = min(n, len(pending_tail), len(audio))
+        is_last = i == total - 1
+        if is_last or real_boundary[i]:
+            groups.append(current[0] if len(current) == 1 else np.concatenate(current, axis=0))
+            current = []
+
+    return groups
+
+
+def _local_crossfade_concat(
+    groups: list["np.ndarray"], crossfade_ms: float, target_lengths: list[int]
+) -> "np.ndarray":
+    """
+    Aplica un crossfade EQUAL-POWER (curva coseno/seno -- la misma curva
+    que implementa el filtro `acrossfade` de ffmpeg con `curve=qsin`, el
+    estándar recomendado para crossfades cortos de voz: mantiene la
+    potencia percibida constante durante la transición, a diferencia de
+    un crossfade LINEAL que sí produce un bajón de volumen perceptible en
+    el punto medio) entre cada `keep_segment` de `groups` (en orden;
+    TODAS las fronteras entre grupos son reales por construcción, ver
+    _decode_fragment_groups) -- ver "Micro-crossfade en los empalmes de
+    audio" en el docstring del módulo para el porqué y para por qué esto
+    se implementa en numpy en vez de encadenar el filtro `acrossfade` de
+    ffmpeg.
+
+    A diferencia de la primera versión de este mecanismo (un único
+    reestiramiento GLOBAL al final, ver `_resample_to_length` y
+    "Reestirado LOCAL en vez de global" en el docstring del módulo), cada
+    `keep_segment` se reestira aquí INDIVIDUALMENTE justo después de
+    aplicar su crossfade, de vuelta a `target_lengths[i]` -- el objetivo
+    de ESE segmento concreto, en muestras. `target_lengths[i]` debe ser
+    la duración REAL DEL VÍDEO de ese `keep_segment` (medida en frames,
+    ver `_count_video_frames` y "Vídeo más largo que audio en cada
+    recodificación" en el docstring del módulo), NO `len(groups[i])` (la
+    longitud tal cual quedó el audio al extraerlo) -- ambas pueden
+    diferir unos pocos ms incluso sin crossfade de por medio, porque la
+    recodificación de vídeo y la de audio no redondean igual al mismo
+    `-ss`/`-to`. Así el acortamiento del crossfade Y cualquier diferencia
+    de precisión entre la extracción de audio y la de vídeo se corrigen
+    ambos exactamente DONDE ocurren, en vez de repartirse con una única
+    tasa global sobre todo el vídeo. La suma final es, por construcción,
+    exactamente `sum(target_lengths)` -- si estos vienen de medir el
+    vídeo real, esa suma YA es la duración total del vídeo, así que el
+    resultado queda sample-exacto sin necesitar ningún reestirado global
+    posterior (ver _write_crossfaded_audio, que conserva uno residual
+    minúsculo solo como red de seguridad).
+
+    `crossfade_ms` <= 0 desactiva el crossfade (cada grupo se concatena
+    tal cual y se reestira a su target_length -- útil como interruptor de
+    config y como caso base para verificar que el crossfade en sí es lo
+    que cambia el resultado).
+
+    Devuelve un único array numpy float32 (n_muestras, _CROSSFADE_CHANNELS).
+    """
+    import numpy as np
+
+    if not groups:
+        return np.zeros((0, _CROSSFADE_CHANNELS), dtype=np.float32)
+    if len(target_lengths) != len(groups):
+        raise ValueError(
+            f"target_lengths debe tener {len(groups)} elemento(s) (uno por keep_segment), "
+            f"tiene {len(target_lengths)}"
+        )
+
+    n = max(0, int(round(_CROSSFADE_SR * crossfade_ms / 1000)))
+    outputs: list[np.ndarray] = []
+    pending = groups[0]
+    pending_target_len = target_lengths[0]
+
+    for gi in range(1, len(groups)):
+        group = groups[gi]
+        this_n = min(n, len(pending), len(group))
         if this_n > 0:
             t = np.linspace(0.0, np.pi / 2, this_n, dtype=np.float32).reshape(-1, 1)
             fade_out = np.cos(t)
             fade_in = np.sin(t)
-            blended = pending_tail[-this_n:] * fade_out + audio[:this_n] * fade_in
-            if len(pending_tail) > this_n:
-                parts.append(pending_tail[:-this_n])
-            parts.append(blended)
-            remainder = audio[this_n:]
+            blended = pending[-this_n:] * fade_out + group[:this_n] * fade_in
+            finalized = blended if len(pending) <= this_n else np.concatenate([pending[:-this_n], blended], axis=0)
+            remainder = group[this_n:]
         else:
-            # uno de los dos lados no tiene muestras que ofrecer (fragmento
+            # uno de los dos lados no tiene muestras que ofrecer (grupo
             # vacío tras un recorte degenerado) -- no hay nada que
-            # mezclar, se concatena sin crossfade en este punto concreto.
-            parts.append(pending_tail)
-            remainder = audio
+            # mezclar, se concatena en seco en este punto concreto.
+            finalized = pending
+            remainder = group
 
-        if n > 0 and len(remainder) > n:
-            parts.append(remainder[:-n])
-            pending_tail = remainder[-n:]
-        else:
-            pending_tail = remainder
+        outputs.append(_resample_to_length(finalized, pending_target_len))
+        pending = remainder
+        pending_target_len = target_lengths[gi]
 
-    if pending_tail is not None:
-        parts.append(pending_tail)
-
-    if not parts:
-        return np.zeros((0, _CROSSFADE_CHANNELS), dtype=np.float32)
-    return np.concatenate(parts, axis=0)
+    outputs.append(_resample_to_length(pending, pending_target_len))
+    return np.concatenate(outputs, axis=0)
 
 
 def _write_crossfaded_audio(
-    fragment_paths: list[Path], crossfade_ms: float, target_duration_s: float, out_wav_path: Path
+    fragment_paths: list[Path], crossfade_ms: float, real_boundary: list[bool],
+    segment_video_durations_s: list[float], total_target_duration_s: float, out_wav_path: Path,
 ) -> None:
     """
-    Escribe el resultado de _equal_power_crossfade_concat como WAV
-    (intermedio sin pérdida), reestirado a `target_duration_s` exactos
-    (ver _resample_to_length) para que quede sample-exacto con la
-    duración real del vídeo ya concatenado -- sin este paso el audio
-    quedaría más corto por el acortamiento inherente del crossfade en
-    cada empalme (ver _resample_to_length).
+    Agrupa `fragment_paths` por `keep_segment` (_decode_fragment_groups) y
+    aplica el crossfade con reestirado LOCAL por segmento
+    (_local_crossfade_concat -- ver ese docstring para el porqué), y
+    escribe el resultado como WAV (intermedio sin pérdida).
+
+    `segment_video_durations_s` es la duración REAL DEL VÍDEO (medida en
+    frames, no derivada del audio) de cada `keep_segment` POR SEPARADO,
+    en el MISMO orden que los grupos que produce `_decode_fragment_groups`
+    -- ver "Vídeo más largo que audio en cada recodificación" en el
+    docstring del módulo para el porqué de medir esto por separado en vez
+    de fiarse de la longitud con la que se extrajo el audio de cada
+    fragmento. `total_target_duration_s` es la duración TOTAL real del
+    vídeo YA UNIDO (`_video_info(cut_path)`, medida de forma
+    INDEPENDIENTE, no derivada de sumar `segment_video_durations_s`) --
+    IMPORTANTE que sea independiente: si se derivara de la misma suma que
+    ya corrige `_local_crossfade_concat`, el reestirado final dejaría de
+    ser una red de seguridad de verdad (no podría detectar ninguna
+    discrepancia entre medir cada fragmento por separado ANTES de unirlos
+    y medir el archivo YA UNIDO, sea cual sea su origen).
+
+    El resultado de _local_crossfade_concat mide, por construcción,
+    exactamente `sum(segment_video_durations_s)` -- que DEBERÍA coincidir
+    con `total_target_duration_s`, pero el reestirado final a
+    `total_target_duration_s` (independiente) sigue aplicándose aquí como
+    red de seguridad genuina, no como la corrección principal (esa ya se
+    aplicó localmente, por segmento, en _local_crossfade_concat).
     """
     import soundfile as sf
 
-    audio = _equal_power_crossfade_concat(fragment_paths, crossfade_ms)
-    target_length = round(target_duration_s * _CROSSFADE_SR)
-    audio = _resample_to_length(audio, target_length)
+    groups = _decode_fragment_groups(fragment_paths, real_boundary)
+    target_lengths = [round(d * _CROSSFADE_SR) for d in segment_video_durations_s]
+    audio = _local_crossfade_concat(groups, crossfade_ms, target_lengths)
+    total_target_length = round(total_target_duration_s * _CROSSFADE_SR)
+    audio = _resample_to_length(audio, total_target_length)
     sf.write(str(out_wav_path), audio, _CROSSFADE_SR, subtype="FLOAT")
 
 
@@ -1200,15 +1530,32 @@ def _resample_to_length(audio: "np.ndarray", target_length: int) -> "np.ndarray"
     subtítulos (que asume que la deriva es la de redondeo de keyframes ya
     documentada, mucho más pequeña).
 
-    Se corrige con un ÚNICO estiramiento global e imperceptible al final
-    (en vez de complicar cada empalme individualmente para que no
-    acorte nada): la magnitud típica es un cambio de velocidad de audio
-    de bastante menos del 1% (p.ej. ~12s repartidos en ~5800s de
-    contenido en una grabación real de referencia, ~0.2%) -- muy por
-    debajo del umbral perceptible de cambio de tempo/tono en audio
-    hablado (referencia habitual: 2-5%), así que una interpolación lineal
-    simple (sin librerías de time-stretch con preservación de tono) es
-    suficiente, no introduce artefactos audibles a esta escala.
+    Usada en DOS sitios con dos objetivos distintos (ver "Reestirado LOCAL
+    en vez de global" en el docstring del módulo para la investigación
+    completa que llevó a esto):
+
+    1. `_local_crossfade_concat` la llama una vez POR `keep_segment`,
+       justo después de aplicarle su crossfade, para devolverlo a su
+       propia longitud EXACTA -- el mecanismo PRINCIPAL de corrección,
+       LOCAL (cada segmento corrige solo su propio acortamiento, donde
+       ocurrió). La magnitud aquí es proporcional a cuánto pesa
+       `crossfade_ms` sobre la duración de ESE segmento concreto (más en
+       segmentos cortos/tramos con cortes muy seguidos, menos en
+       segmentos largos) -- siempre muy por debajo del umbral perceptible
+       de cambio de tempo/tono en audio hablado (referencia habitual:
+       2-5%) incluso en el caso más corto realista
+       (`min_kept_segment_seconds`, 0.6s por defecto: ~3.3% con
+       crossfade_ms=20).
+    2. `_write_crossfaded_audio` la llama una ÚLTIMA vez, GLOBAL, sobre
+       el audio ya localmente corregido -- una red de seguridad para la
+       discrepancia MINÚSCULA que pueda quedar frente a la duración real
+       del vídeo (redondeo de la propia extracción de audio de cada
+       fragmento, del orden de unas pocas muestras acumuladas, no
+       segundos) -- normalmente un no-op o casi.
+
+    En ambos casos, una interpolación lineal simple (sin librerías de
+    time-stretch con preservación de tono) es suficiente a estas
+    magnitudes, no introduce artefactos audibles.
     """
     import numpy as np
 
@@ -1293,10 +1640,23 @@ def _cut_video(
         len(keep_segments),
     )
     segment_paths: list[Path] = []
+    # boundary_is_real[i] indica si la frontera entre segment_paths[i] y
+    # segment_paths[i + 1] es un corte REAL entre dos keep_segments
+    # distintos (True) o una frontera INTERNA espuria entre los
+    # sub-fragmentos head/mid/tail de un mismo keep_segment, generada solo
+    # por el renderizado parcial sin pérdida (False) -- ver "Fronteras
+    # internas espurias del renderizado parcial sin pérdida" en el
+    # docstring del módulo. Cada keep_segment aporta como mucho una
+    # frontera real (con el anterior) y len(fragments)-1 fronteras
+    # internas (consigo mismo).
+    boundary_is_real: list[bool] = []
     n_partial = 0
     n_full_recode = 0
     for i, (start, end) in enumerate(keep_segments):
         fragments = _cut_segment_smart(input_path, start, end, keyframes, fps, i, len(keep_segments), out_dir)
+        if segment_paths:
+            boundary_is_real.append(True)
+        boundary_is_real.extend([False] * (len(fragments) - 1))
         segment_paths.extend(fragments)
         if len(fragments) == 1:
             n_full_recode += 1
@@ -1317,13 +1677,54 @@ def _cut_video(
 
     if audio_crossfade_ms > 0:
         t_cf = time.monotonic()
+        n_real = sum(boundary_is_real)
+        n_internal = len(boundary_is_real) - n_real
         logger.info(
-            "Aplicando micro-crossfade de audio (%.0fms, equal-power) en %d unión(es) entre fragmentos...",
-            audio_crossfade_ms, len(segment_paths) - 1,
+            "Aplicando micro-crossfade de audio (%.0fms, equal-power) en %d frontera(s) real(es) entre "
+            "tramos distintos (%d frontera(s) interna(s) espuria(s) del renderizado parcial sin pérdida "
+            "se concatenan en seco, sin crossfade)...",
+            audio_crossfade_ms, n_real, n_internal,
         )
-        target_duration = _video_info(cut_path)["duration"]
+
+        # Nº de frames de vídeo de cada fragmento -- solo para saber
+        # cuántos frames aporta cada uno al conjunto (no su duración: esa
+        # se mide directamente del vídeo YA UNIDO más abajo, ver "Redondeo
+        # del concat demuxer en el vídeo ya unido" en el docstring del
+        # módulo). Log de progreso periódico por el mismo motivo que el
+        # bucle de decodificación de audio (cientos de llamadas a ffprobe).
+        t_fc = time.monotonic()
+        ultimo_log_fc = t_fc
+        frame_counts: list[int] = []
+        for i, p in enumerate(segment_paths):
+            frame_counts.append(_count_video_frames(p))
+            ahora = time.monotonic()
+            if (i + 1) % _CROSSFADE_PROGRESS_EVERY_FRAGMENTS == 0 or (ahora - ultimo_log_fc) >= _CROSSFADE_PROGRESS_EVERY_SECONDS or i + 1 == len(segment_paths):
+                logger.info(
+                    "Progreso medición de vídeo real: %d/%d fragmento(s), %.1fs transcurridos",
+                    i + 1, len(segment_paths), ahora - t_fc,
+                )
+                ultimo_log_fc = ahora
+
+        # Duración REAL de cada keep_segment, medida directamente sobre
+        # los PTS del vídeo YA UNIDO (`cut_path`) -- NO frames/fps sobre
+        # los fragmentos SIN unir. Necesario porque el concat demuxer
+        # introduce un pequeño redondeo de PTS en cada unión al pegar los
+        # fragmentos (ver "Redondeo del concat demuxer en el vídeo ya
+        # unido" en el docstring del módulo) -- frames/fps sobre cada
+        # fragmento por separado es exacto para ESE fragmento, pero no
+        # refleja ese redondeo acumulado, que se concentra justo en los
+        # tramos con más cortes seguidos (más fragmentos, más uniones).
+        total_target_duration = _video_info(cut_path)["duration"]
+        sorted_pts = _scan_video_pts(cut_path)
+        segment_video_durations_s = _group_video_durations_from_pts(
+            frame_counts, boundary_is_real, sorted_pts, total_target_duration,
+        )
+
         wav_path = out_dir / "_cuts_crossfade_audio.wav"
-        _write_crossfaded_audio(segment_paths, audio_crossfade_ms, target_duration, wav_path)
+        _write_crossfaded_audio(
+            segment_paths, audio_crossfade_ms, boundary_is_real,
+            segment_video_durations_s, total_target_duration, wav_path,
+        )
         crossfaded_path = out_dir / "_cuts_crossfade.mp4"
         _replace_audio_track(cut_path, wav_path, crossfaded_path)
         wav_path.unlink(missing_ok=True)
