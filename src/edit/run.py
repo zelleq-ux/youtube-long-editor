@@ -94,6 +94,31 @@ COMPLETO por un filtro `concat` junto con el outro; el fix (evitar el
 filtro `concat` del todo, no acotarlo) se generaliza aquí a los tres
 niveles.
 
+Sonoridad del intro (bug real reportado por el usuario, 2026-08-15,
+notado de oído en witchfire_1 tras el fix de desincronización de más
+arriba): `run()` aplica `normalize_audio` (loudnorm) al contenido
+principal ANTES de `prepend_intro` -- el intro, al unirse DESPUÉS, nunca
+pasaba por loudnorm en absoluto, así que sonaba a lo que fuera su nivel
+de grabación original (más flojo que el objetivo de sonoridad del
+contenido principal, -14 LUFS). `_match_audio_only`/`_match_full`
+(los dos niveles de `_glue_extra_clip` que SÍ recodifican audio) aceptan
+ahora un `loudnorm_filter` opcional que se antepone al filtro `aformat`
+ya existente -- sin coste extra en los casos que ya recodifican audio de
+todos modos (que es el caso real: el intro de este proyecto casi siempre
+difiere en resolución/fps del contenido principal, por venir de una
+sesión de grabación aparte, así que ya pasa por el nivel de recodificación
+completa). `prepend_intro` mide la sonoridad del intro
+(`_measure_loudness`) y construye el filtro (`_build_loudnorm_filter`,
+extraída de `normalize_audio` para reutilizarla aquí) con el MISMO
+objetivo que el contenido principal, respetando el mismo interruptor
+`config['edit']['loudnorm']`. La vía rápida de copia directa (nivel 1,
+sin recodificar nada) queda inhabilitada cuando se pide nivelado de
+sonoridad -- `_glue_extra_clip` trata ese caso como "el audio difiere"
+aunque los parámetros de stream coincidan, para no poder saltarse el
+filtro nunca. El outro NO se toca (sigue sin nivelarse): es un asset fijo
+preparado aparte por el usuario con su propio nivel ya decidido, no una
+grabación que varíe de vídeo en vídeo como el intro.
+
 Los tramos de habla continua se identifican sobre los timestamps del
 transcript, que son del vídeo ORIGINAL (antes de cortar). Como el zoom se
 aplica sobre el vídeo YA CORTADO, cada timestamp se remapea restando la
@@ -1959,6 +1984,25 @@ def _measure_loudness(path: str) -> dict | None:
         return None
 
 
+def _build_loudnorm_filter(measured: dict | None) -> str:
+    """
+    Construye el filtro `loudnorm` de ffmpeg contra los objetivos de
+    sonoridad del módulo (_LOUDNORM_TARGET_*), en modo "segunda pasada"
+    (con las medidas ya tomadas por `_measure_loudness`, `linear=true`
+    para una corrección más precisa) si `measured` está disponible, o en
+    modo de una sola pasada (menos preciso pero sin depender de haber
+    podido medir antes) si no.
+    """
+    if measured is None:
+        return f"loudnorm=I={_LOUDNORM_TARGET_I}:TP={_LOUDNORM_TARGET_TP}:LRA={_LOUDNORM_TARGET_LRA}"
+    return (
+        f"loudnorm=I={_LOUDNORM_TARGET_I}:TP={_LOUDNORM_TARGET_TP}:LRA={_LOUDNORM_TARGET_LRA}:"
+        f"measured_I={measured.get('input_i')}:measured_TP={measured.get('input_tp')}:"
+        f"measured_LRA={measured.get('input_lra')}:measured_thresh={measured.get('input_thresh')}:"
+        f"offset={measured.get('target_offset')}:linear=true:print_format=summary"
+    )
+
+
 def normalize_audio(clip_path: str, config: dict) -> str:
     """
     Normaliza el audio de clip_path con ffmpeg loudnorm (dos pasadas: mide
@@ -1976,16 +2020,7 @@ def normalize_audio(clip_path: str, config: dict) -> str:
 
     measured = _measure_loudness(clip_path)
     output_path = str(Path(clip_path).with_name("_normalized.mp4"))
-
-    if measured is None:
-        loudnorm_filter = f"loudnorm=I={_LOUDNORM_TARGET_I}:TP={_LOUDNORM_TARGET_TP}:LRA={_LOUDNORM_TARGET_LRA}"
-    else:
-        loudnorm_filter = (
-            f"loudnorm=I={_LOUDNORM_TARGET_I}:TP={_LOUDNORM_TARGET_TP}:LRA={_LOUDNORM_TARGET_LRA}:"
-            f"measured_I={measured.get('input_i')}:measured_TP={measured.get('input_tp')}:"
-            f"measured_LRA={measured.get('input_lra')}:measured_thresh={measured.get('input_thresh')}:"
-            f"offset={measured.get('target_offset')}:linear=true:print_format=summary"
-        )
+    loudnorm_filter = _build_loudnorm_filter(measured)
 
     cmd = [
         "ffmpeg", "-y", "-i", clip_path,
@@ -2042,37 +2077,57 @@ def _ordered_for_position(main_path: Path, extra_path: Path, position: str) -> l
     raise ValueError(f"position debe ser 'before' o 'after', no {position!r}")
 
 
-def _match_audio_only(extra_path: Path, main_info: dict, out_path: Path, description: str) -> None:
-    """Recodifica SOLO el audio de extra_path para que encaje con main_info -- vídeo copiado (-c:v copy), sin recodificar."""
+def _match_audio_only(
+    extra_path: Path, main_info: dict, out_path: Path, description: str, loudnorm_filter: str | None = None,
+) -> None:
+    """
+    Recodifica SOLO el audio de extra_path para que encaje con main_info
+    -- vídeo copiado (-c:v copy), sin recodificar. `loudnorm_filter` (ver
+    _build_loudnorm_filter), si se da, se antepone a `aformat` en la
+    misma pasada -- usado para nivelar la sonoridad del intro al mismo
+    objetivo que el contenido principal, ver "Sonoridad del intro" en el
+    docstring del módulo.
+    """
     channels = main_info["channels"] or 2
     channel_layout = "stereo" if channels >= 2 else "mono"
+    af = f"aformat=sample_rates={main_info['sample_rate']}:channel_layouts={channel_layout}"
+    if loudnorm_filter:
+        af = f"{loudnorm_filter},{af}"
     cmd = [
         "ffmpeg", "-y", "-i", str(extra_path),
         "-c:v", "copy",
-        "-af", f"aformat=sample_rates={main_info['sample_rate']}:channel_layouts={channel_layout}",
+        "-af", af,
         "-c:a", "aac", "-ar", str(main_info["sample_rate"]), "-ac", str(channels), "-b:a", "192k",
         str(out_path),
     ]
     _run_ffmpeg(cmd, description=description)
 
 
-def _match_full(extra_path: Path, main_info: dict, out_path: Path, description: str) -> None:
+def _match_full(
+    extra_path: Path, main_info: dict, out_path: Path, description: str, loudnorm_filter: str | None = None,
+) -> None:
     """
     Recodifica vídeo+audio de extra_path para que encaje con main_info
     (resolución/fps/sample_rate/canales) -- SIEMPRE se escala el clip
     EXTRA (intro u outro) a los parámetros del clip PRINCIPAL, nunca al
     revés (ver "Unión de clips extra" en el docstring del módulo).
+    `loudnorm_filter` (ver _build_loudnorm_filter), si se da, se antepone
+    a `aformat` en la misma pasada de recodificación de audio -- sin
+    coste extra, ya que este camino recodifica el audio de todos modos.
     """
     width, height, fps = main_info["width"], main_info["height"], main_info["fps"]
     sample_rate = main_info["sample_rate"] or 48000
     channels = main_info["channels"] or 2
     channel_layout = "stereo" if channels >= 2 else "mono"
+    af = f"aformat=sample_rates={sample_rate}:channel_layouts={channel_layout}"
+    if loudnorm_filter:
+        af = f"{loudnorm_filter},{af}"
     cmd = [
         "ffmpeg", "-y", "-i", str(extra_path),
         "-vf",
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}",
-        "-af", f"aformat=sample_rates={sample_rate}:channel_layouts={channel_layout}",
+        "-af", af,
         "-c:v", "libx264", "-crf", "20", "-preset", "medium", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-ar", str(sample_rate), "-ac", str(channels), "-b:a", "192k",
         str(out_path),
@@ -2082,11 +2137,13 @@ def _match_full(extra_path: Path, main_info: dict, out_path: Path, description: 
 
 def _glue_via_full_recode(
     main_path: Path, main_info: dict, extra_path: Path, position: str, out_path: Path, extra_label: str,
+    loudnorm_filter: str | None = None,
 ) -> tuple[Path, float]:
     matched_path = out_path.with_name(f"_{extra_label}_full_matched.mp4")
     _match_full(
         extra_path, main_info, matched_path,
         description=f"Normalizando el {extra_label} a los parámetros del clip principal",
+        loudnorm_filter=loudnorm_filter,
     )
     duration = _video_info(matched_path)["duration"]
     _glue_with_faststart(
@@ -2099,6 +2156,7 @@ def _glue_via_full_recode(
 
 def _glue_extra_clip(
     main_path: Path, extra_path: Path, position: str, out_path: Path, extra_label: str,
+    loudnorm_filter: str | None = None,
 ) -> tuple[Path, float]:
     """
     Une extra_path (intro o outro) con main_path (el clip principal, que
@@ -2111,6 +2169,15 @@ def _glue_extra_clip(
             (lo pospone, p.ej. outro).
         extra_label: nombre corto para logs/nombres de archivo intermedio
             ("intro"/"outro").
+        loudnorm_filter: filtro `loudnorm` (ver _build_loudnorm_filter) a
+            aplicar al audio de `extra_path` antes de unirlo -- usado por
+            `prepend_intro` para nivelar la sonoridad del intro al mismo
+            objetivo que el contenido principal (ver "Sonoridad del
+            intro" en el docstring del módulo). Si se da, fuerza como
+            MÍNIMO el nivel de "solo audio difiere" (nunca la vía rápida
+            de copia directa, que no podría aplicar ningún filtro).
+            `None` (el valor por defecto, usado por `append_outro`)
+            preserva el comportamiento de siempre.
 
     Returns:
         (out_path, duración en segundos de extra_path tal y como queda
@@ -2120,7 +2187,7 @@ def _glue_extra_clip(
     main_info = _video_info(main_path)
     extra_info = _video_info(extra_path)
     video_matches = _same_video_params(main_info, extra_info)
-    audio_matches = _same_audio_params(main_info, extra_info)
+    audio_matches = _same_audio_params(main_info, extra_info) and loudnorm_filter is None
 
     if video_matches and audio_matches:
         logger.info(
@@ -2142,19 +2209,23 @@ def _glue_extra_clip(
             "recodificando el %s por completo para unirlo:\n%s",
             extra_label, extra_label, result.stderr[-1000:],
         )
-        return _glue_via_full_recode(main_path, main_info, extra_path, position, out_path, extra_label)
+        return _glue_via_full_recode(
+            main_path, main_info, extra_path, position, out_path, extra_label, loudnorm_filter,
+        )
 
-    if video_matches:  # solo difiere el audio -- caso nuevo respecto al append_outro original, ver _smart_concat
+    if video_matches:  # solo difiere el audio (o se pidió loudnorm) -- ver _smart_concat
         logger.info(
-            "El %s solo difiere en audio del clip principal (principal=%sHz/%sch, %s=%sHz/%sch); "
+            "El %s solo difiere en audio del clip principal (principal=%sHz/%sch, %s=%sHz/%sch)%s; "
             "ajustando SOLO el audio (vídeo copiado sin recodificar) antes de unir.",
             extra_label, main_info["sample_rate"], main_info["channels"],
             extra_label, extra_info["sample_rate"], extra_info["channels"],
+            " (incluye nivelado de sonoridad)" if loudnorm_filter else "",
         )
         matched_path = out_path.with_name(f"_{extra_label}_audio_matched.mp4")
         _match_audio_only(
             extra_path, main_info, matched_path,
             description=f"Ajustando audio del {extra_label} para unirlo sin recodificar el vídeo",
+            loudnorm_filter=loudnorm_filter,
         )
         duration = _video_info(matched_path)["duration"]
         _glue_with_faststart(
@@ -2171,7 +2242,7 @@ def _glue_extra_clip(
         extra_label, main_info["width"], main_info["height"], main_info["fps"],
         extra_label, extra_info["width"], extra_info["height"], extra_info["fps"], extra_label,
     )
-    return _glue_via_full_recode(main_path, main_info, extra_path, position, out_path, extra_label)
+    return _glue_via_full_recode(main_path, main_info, extra_path, position, out_path, extra_label, loudnorm_filter)
 
 
 def append_outro(clip_path: str, config: dict) -> str:
@@ -2236,8 +2307,20 @@ def prepend_intro(clip_path: str, video_id: str, config: dict) -> str:
         )
         return clip_path
 
+    # Nivela la sonoridad del intro al mismo objetivo que el contenido
+    # principal -- ver "Sonoridad del intro" en el docstring del módulo
+    # para el porqué (el intro se une DESPUÉS de normalize_audio, así que
+    # sin esto nunca pasa por loudnorm y suena más flojo que el resto).
+    # Respeta el mismo interruptor que el contenido principal.
+    loudnorm_filter = None
+    if edit_config.get("loudnorm", True):
+        measured_intro = _measure_loudness(str(intro_path))
+        loudnorm_filter = _build_loudnorm_filter(measured_intro)
+
     output_path = Path(clip_path).with_name("_with_intro.mp4")
-    result_path, intro_duration = _glue_extra_clip(Path(clip_path), intro_path, "before", output_path, "intro")
+    result_path, intro_duration = _glue_extra_clip(
+        Path(clip_path), intro_path, "before", output_path, "intro", loudnorm_filter,
+    )
     logger.info("Intro añadido al principio del vídeo (%.2fs, %s).", intro_duration, intro_path.name)
     return str(result_path)
 

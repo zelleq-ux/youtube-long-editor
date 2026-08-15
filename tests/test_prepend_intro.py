@@ -16,7 +16,11 @@ intro.mp4, o con config['edit']['prepend_intro']=False) y la comprobación
 de que el clip PRINCIPAL nunca se recodifica en ninguno de los tres casos
 (mismo tipo de comprobación bit-exacta que tests/test_append_outro_pts.py,
 pero comparando el FINAL del elementary stream -- el clip principal va
-SEGUNDO en la lista del concat demuxer cuando position="before").
+SEGUNDO en la lista del concat demuxer cuando position="before"). También
+cubre el fix de "Sonoridad del intro" (2026-08-15, ver docstring de
+src/edit/run.py): un intro grabado mucho más flojo que el objetivo de
+sonoridad debe quedar nivelado tras prepend_intro, no conservar su nivel
+de grabación original.
 
 Uso:
     cd <repo_root>
@@ -37,7 +41,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.edit.run import prepend_intro  # noqa: E402
+from src.edit.run import _LOUDNORM_TARGET_I, _measure_loudness, prepend_intro  # noqa: E402
 from tests.scale_test_edit_pipeline import check_av_duration_consistency, check_pts_continuity  # noqa: E402
 
 failures: list[str] = []
@@ -62,16 +66,16 @@ def _run(cmd: list[str]) -> None:
 
 def _generate_clip(
     path: Path, width: int, height: int, fps: float, duration: float,
-    sample_rate: int, channels: int, freq: int = 440,
+    sample_rate: int, channels: int, freq: int = 440, amplitude: float = 1.0,
 ) -> None:
     channel_layout = "stereo" if channels >= 2 else "mono"
     _run([
         "ffmpeg", "-y",
         "-f", "lavfi", "-i", f"testsrc2=size={width}x{height}:rate={fps}:duration={duration}",
-        "-f", "lavfi", "-i", f"sine=frequency={freq}:duration={duration}",
+        "-f", "lavfi", "-i", f"sine=frequency={freq}:duration={duration}:sample_rate={sample_rate}",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-ar", str(sample_rate), "-ac", str(channels),
-        "-af", f"aformat=channel_layouts={channel_layout}",
+        "-af", f"volume={amplitude},aformat=channel_layouts={channel_layout}",
         "-movflags", "+faststart",
         str(path),
     ])
@@ -162,6 +166,57 @@ def _check_prepend(
     )
 
 
+def _extract_clip(src: Path, duration: float, out_path: Path) -> None:
+    _run(["ffmpeg", "-y", "-i", str(src), "-t", f"{duration:.6f}", "-c", "copy", str(out_path)])
+
+
+def _check_intro_loudness_matched(work_dir: Path, main_path: Path) -> None:
+    """
+    Regresión de "Sonoridad del intro" (ver docstring de src/edit/run.py):
+    un intro grabado mucho más FLOJO que el objetivo de sonoridad debe
+    quedar nivelado al mismo objetivo que el contenido principal tras
+    prepend_intro -- antes del fix, el intro nunca pasaba por loudnorm en
+    absoluto (se unía DESPUÉS de normalize_audio) y conservaba su nivel
+    de grabación original.
+    """
+    print("=== prepend_intro(): nivelado de sonoridad del intro ===")
+    video_id = "video_quiet_intro"
+    output_dir = work_dir / "output" / video_id
+    output_dir.mkdir(parents=True)
+    intro_path = output_dir / "intro.mp4"
+    intro_duration = 3.0
+    # Resolución distinta a la del clip principal (fuerza el nivel de
+    # recodificación completa, el caso REAL de este proyecto -- el intro
+    # casi siempre viene de una sesión de OBS aparte con otra config) y
+    # amplitud MUY floja (0.03 ≈ -30dB) para que el nivelado sea inequívoco.
+    _generate_clip(
+        intro_path, 1280, 720, 25, intro_duration, 44100, 1, freq=880, amplitude=0.03,
+    )
+    quiet_measured = _measure_loudness(str(intro_path))
+    quiet_lufs = quiet_measured.get("input_i") if quiet_measured else None
+
+    config = {"paths": {"output": str(work_dir / "output")}, "edit": {"prepend_intro": True, "loudnorm": True}}
+    result_path = Path(prepend_intro(str(main_path), video_id, config))
+
+    intro_only_path = work_dir / "result_intro_only.mp4"
+    _extract_clip(result_path, intro_duration - 0.2, intro_only_path)  # margen para no rozar la costura
+    result_measured = _measure_loudness(str(intro_only_path))
+    result_lufs = float(result_measured["input_i"]) if result_measured else None
+
+    check(
+        "el intro original es MUCHO más flojo que el objetivo de sonoridad "
+        "(confirma que el caso de prueba no es degenerado)",
+        quiet_lufs is not None and float(quiet_lufs) < _LOUDNORM_TARGET_I - 5,
+        f"intro_original_LUFS={quiet_lufs}",
+    )
+    check(
+        "el intro YA UNIDO queda nivelado cerca del objetivo de sonoridad del contenido "
+        "principal (no conserva su nivel de grabación original)",
+        result_lufs is not None and abs(result_lufs - _LOUDNORM_TARGET_I) < 2.0,
+        f"intro_original_LUFS={quiet_lufs} intro_ya_unido_LUFS={result_lufs} objetivo={_LOUDNORM_TARGET_I}",
+    )
+
+
 def main() -> int:
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         print("ffmpeg/ffprobe no están en PATH; no se puede ejecutar este test.")
@@ -194,6 +249,8 @@ def main() -> int:
             intro_width=1280, intro_height=720, intro_fps=25,
             intro_duration=2.0, intro_sample_rate=44100, intro_channels=1,
         )
+
+        _check_intro_loudness_matched(work_dir, main_path)
 
         print("=== retrocompatibilidad: sin data/output/<video_id>/intro.mp4 -> clip sin cambios ===")
         video_id_no_intro = "video_no_intro"
