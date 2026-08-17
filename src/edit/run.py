@@ -816,6 +816,7 @@ def _video_info(path: Path) -> dict:
         "width": int(video_stream["width"]),
         "height": int(video_stream["height"]),
         "fps": fps,
+        "codec_name": video_stream.get("codec_name"),
         "sample_rate": int(audio_stream["sample_rate"]) if audio_stream.get("sample_rate") else None,
         "channels": audio_stream.get("channels"),
     }
@@ -2036,7 +2037,18 @@ def normalize_audio(clip_path: str, config: dict) -> str:
 
 
 def _same_video_params(a: dict, b: dict) -> bool:
-    return a["width"] == b["width"] and a["height"] == b["height"] and abs(a["fps"] - b["fps"]) <= 0.01
+    # El códec de vídeo debe coincidir además de resolución/fps: si no, un
+    # "-c:v copy" al concatenar (vía _glue_extra_clip) mete bytes de un
+    # códec dentro de un contenedor que declara el otro -- el resultado
+    # decodifica bien el primer clip y basura el resto (visto con un intro
+    # grabado en HEVC vs. contenido principal en H.264 tras el re-encode
+    # de ingest, misma resolución/fps/pix_fmt en ambos).
+    return (
+        a["width"] == b["width"]
+        and a["height"] == b["height"]
+        and abs(a["fps"] - b["fps"]) <= 0.01
+        and a["codec_name"] == b["codec_name"]
+    )
 
 
 def _same_audio_params(a: dict, b: dict) -> bool:
