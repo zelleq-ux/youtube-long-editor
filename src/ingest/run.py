@@ -13,6 +13,8 @@ import logging
 import re
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 from src.common import db
@@ -21,6 +23,72 @@ from src.common.config import REPO_ROOT, load_config
 logger = logging.getLogger(__name__)
 
 _REQUIRED_BINARIES = ("ffmpeg", "ffprobe")
+
+_INGEST_PROGRESS_EVERY_SECONDS = 10.0
+
+
+def _run_ffmpeg_with_progress(cmd: list[str], *, total_duration_s: float) -> None:
+    """
+    Ejecuta el re-encode de ingesta emitiendo progreso periódico por log.
+
+    Es la única llamada a ffmpeg de todo el pipeline que procesa el vídeo
+    COMPLETO en una sola invocación (1-2h); con subprocess.run(capture_output=True)
+    no emite ningún stdout hasta terminar, lo que en tareas de background
+    se ha observado que provoca que el proceso se mate externamente por
+    "silencio" aunque siga avanzando de verdad (ver status.md / mismo
+    patrón cada-N-segundos ya usado en el crossfade de edit/run.py).
+    """
+    progress_cmd = [*cmd[:-1], "-progress", "pipe:1", "-nostats", cmd[-1]]
+    proceso = subprocess.Popen(
+        progress_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    assert proceso.stdout is not None
+    assert proceso.stderr is not None
+
+    # ffmpeg puede emitir avisos repetidos por frame (p.ej. con pix_fmt
+    # yuvj420p de entrada) que llenan el buffer del pipe de stderr en
+    # segundos; si no se drena en paralelo al bucle de stdout de abajo,
+    # ffmpeg se bloquea escribiendo y el proceso entero se queda
+    # colgado (CPU ~0%) sin dar ningún error. Se drena en un hilo aparte
+    # guardando solo la cola para el mensaje de error si hace falta.
+    stderr_tail: list[str] = []
+
+    def _drenar_stderr() -> None:
+        for linea in proceso.stderr:  # type: ignore[union-attr]
+            stderr_tail.append(linea)
+            if len(stderr_tail) > 200:
+                del stderr_tail[:-200]
+
+    hilo_stderr = threading.Thread(target=_drenar_stderr, daemon=True)
+    hilo_stderr.start()
+
+    out_time_s = 0.0
+    ultimo_log = time.monotonic()
+    for linea in proceso.stdout:
+        linea = linea.strip()
+        if linea.startswith("out_time=") and "N/A" not in linea:
+            valor = linea.split("=", 1)[1]
+            try:
+                h, m, s = valor.split(":")
+                out_time_s = int(h) * 3600 + int(m) * 60 + float(s)
+            except ValueError:
+                pass
+        ahora = time.monotonic()
+        if ahora - ultimo_log >= _INGEST_PROGRESS_EVERY_SECONDS:
+            pct = (out_time_s / total_duration_s * 100) if total_duration_s else 0.0
+            logger.info(
+                "Normalizando: %.1f/%.1fs (%.1f%%)", out_time_s, total_duration_s, pct
+            )
+            ultimo_log = ahora
+
+    returncode = proceso.wait()
+    hilo_stderr.join(timeout=5.0)
+    if returncode != 0:
+        raise RuntimeError(f"ffmpeg falló al normalizar:\n{''.join(stderr_tail)[-4000:]}")
 
 
 def _check_binarios_disponibles() -> None:
@@ -239,9 +307,7 @@ def run(video_id: str, config: dict, *, local_path: str) -> dict:
     ]
 
     logger.info("Normalizando con ffmpeg (re-encode H.264/AAC)...")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg falló al normalizar {input_path}:\n{result.stderr[-4000:]}")
+    _run_ffmpeg_with_progress(cmd, total_duration_s=duration_s)
 
     logger.info(
         "Ingesta completa: video_id=%s raw_path=%s duration_s=%.2f",
