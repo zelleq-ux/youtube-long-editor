@@ -88,7 +88,8 @@ edit:
                                     # concatenando sin recodificar, sin crossfade). 0 desactiva el crossfade.
 
 thumbnail:
-  enabled: true                    # extraer frames candidatos automáticamente; si es false, run() no hace nada (avisa en el log)
+  enabled: false                   # extraer frames candidatos automáticamente; si es false, run() no hace nada (avisa en el log) --
+                                    # desactivado 2026-08-20: ya no se usan los candidatos, el thumbnail se saca a mano del vídeo directamente
   candidate_sample_count: 60       # nº de puntos muestreados por movimiento a lo largo del vídeo ANTES de quedarse
                                     # con los --num-candidates de mayor puntuación separados por --min-gap-seconds
                                     # (ver src/thumbnail/run.py); muestreo ligero (diferencia de píxeles, no optical
