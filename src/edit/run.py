@@ -678,6 +678,7 @@ import logging
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -822,11 +823,81 @@ def _video_info(path: Path) -> dict:
     }
 
 
-def _run_ffmpeg(cmd: list[str], *, description: str) -> None:
+_FFMPEG_PROGRESS_EVERY_SECONDS = 10.0
+
+
+def _run_ffmpeg_streaming(cmd: list[str], *, description: str, total_duration_s: float | None = None) -> str:
+    """
+    Ejecuta ffmpeg con -progress pipe:1 para loguear avance periódico en
+    vez de bloquear en silencio hasta terminar -- subprocess.run(capture_output=True)
+    no emite nada hasta el final, lo que en tareas de background se ha
+    confirmado que provoca que el proceso se mate externamente por
+    "silencio" aunque siga avanzando de verdad (mismo patrón ya visto y
+    solucionado en el re-encode de ingest/run.py y en el crossfade de este
+    mismo módulo). stderr se drena en un hilo aparte en paralelo al bucle
+    que lee el progreso de stdout -- si no se drena, ffmpeg puede llenar
+    el buffer del pipe de stderr (avisos que se repiten por frame) y
+    quedarse bloqueado escribiendo, colgando el proceso entero a CPU ~0%
+    sin ningún error.
+
+    Devuelve las últimas (como mucho) 200 líneas de stderr -- de sobra
+    para el resumen de loudnorm de _measure_loudness (se imprime casi al
+    final) y para un mensaje de error útil si ffmpeg falla.
+    """
     logger.info("%s...", description)
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg falló ({description}):\n{result.stderr[-4000:]}")
+    progress_cmd = [*cmd[:-1], "-progress", "pipe:1", "-nostats", cmd[-1]]
+    proceso = subprocess.Popen(
+        progress_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    assert proceso.stdout is not None
+    assert proceso.stderr is not None
+
+    stderr_tail: list[str] = []
+
+    def _drenar_stderr() -> None:
+        for linea in proceso.stderr:  # type: ignore[union-attr]
+            stderr_tail.append(linea)
+            if len(stderr_tail) > 200:
+                del stderr_tail[:-200]
+
+    hilo_stderr = threading.Thread(target=_drenar_stderr, daemon=True)
+    hilo_stderr.start()
+
+    out_time_s = 0.0
+    inicio = time.monotonic()
+    ultimo_log = inicio
+    for linea in proceso.stdout:
+        linea = linea.strip()
+        if linea.startswith("out_time=") and "N/A" not in linea:
+            valor = linea.split("=", 1)[1]
+            try:
+                h, m, s = valor.split(":")
+                out_time_s = int(h) * 3600 + int(m) * 60 + float(s)
+            except ValueError:
+                pass
+        ahora = time.monotonic()
+        if ahora - ultimo_log >= _FFMPEG_PROGRESS_EVERY_SECONDS:
+            if total_duration_s:
+                pct = out_time_s / total_duration_s * 100
+                logger.info("%s: %.1f/%.1fs (%.1f%%)", description, out_time_s, total_duration_s, pct)
+            else:
+                logger.info("%s: %.1fs transcurridos (%.1fs de vídeo procesados)", description, ahora - inicio, out_time_s)
+            ultimo_log = ahora
+
+    returncode = proceso.wait()
+    hilo_stderr.join(timeout=5.0)
+    stderr_text = "".join(stderr_tail)
+    if returncode != 0:
+        raise RuntimeError(f"ffmpeg falló ({description}):\n{stderr_text[-4000:]}")
+    return stderr_text
+
+
+def _run_ffmpeg(cmd: list[str], *, description: str, total_duration_s: float | None = None) -> None:
+    _run_ffmpeg_streaming(cmd, description=description, total_duration_s=total_duration_s)
 
 
 def detect_long_speech_segments(transcript: dict, cuts: list[dict], config: dict) -> list[dict]:
@@ -1469,6 +1540,10 @@ def _local_crossfade_concat(
     pending = groups[0]
     pending_target_len = target_lengths[0]
 
+    total_groups = len(groups)
+    inicio = time.monotonic()
+    ultimo_log = inicio
+
     for gi in range(1, len(groups)):
         group = groups[gi]
         this_n = min(n, len(pending), len(group))
@@ -1489,6 +1564,14 @@ def _local_crossfade_concat(
         outputs.append(_resample_to_length(finalized, pending_target_len))
         pending = remainder
         pending_target_len = target_lengths[gi]
+
+        ahora = time.monotonic()
+        if ahora - ultimo_log >= _CROSSFADE_PROGRESS_EVERY_SECONDS:
+            logger.info(
+                "Progreso mezcla de crossfades: %d/%d tramo(s), %.1fs transcurridos",
+                gi + 1, total_groups, ahora - inicio,
+            )
+            ultimo_log = ahora
 
     outputs.append(_resample_to_length(pending, pending_target_len))
     return np.concatenate(outputs, axis=0)
@@ -1530,10 +1613,35 @@ def _write_crossfaded_audio(
 
     groups = _decode_fragment_groups(fragment_paths, real_boundary)
     target_lengths = [round(d * _CROSSFADE_SR) for d in segment_video_durations_s]
+
+    logger.info("Mezclando crossfades locales de %d tramo(s) conservado(s)...", len(groups))
+    inicio = time.monotonic()
     audio = _local_crossfade_concat(groups, crossfade_ms, target_lengths)
+    logger.info("Crossfades mezclados en %.1fs.", time.monotonic() - inicio)
+
     total_target_length = round(total_target_duration_s * _CROSSFADE_SR)
+    inicio = time.monotonic()
     audio = _resample_to_length(audio, total_target_length)
-    sf.write(str(out_wav_path), audio, _CROSSFADE_SR, subtype="FLOAT")
+    logger.info("Reestirado global final aplicado en %.1fs.", time.monotonic() - inicio)
+
+    logger.info("Escribiendo audio con crossfade a %s (%d muestra(s))...", out_wav_path, len(audio))
+    inicio = time.monotonic()
+    ultimo_log = inicio
+    chunk_size = max(1, _CROSSFADE_SR * 30)  # bloques de ~30s de audio
+    with sf.SoundFile(
+        str(out_wav_path), mode="w", samplerate=_CROSSFADE_SR, channels=_CROSSFADE_CHANNELS, subtype="FLOAT"
+    ) as f:
+        for offset in range(0, len(audio), chunk_size):
+            f.write(audio[offset:offset + chunk_size])
+            ahora = time.monotonic()
+            if ahora - ultimo_log >= _CROSSFADE_PROGRESS_EVERY_SECONDS:
+                escritas_s = min(offset + chunk_size, len(audio)) / _CROSSFADE_SR
+                logger.info(
+                    "Progreso escritura de audio: %.1f/%.1fs, %.1fs transcurridos",
+                    escritas_s, len(audio) / _CROSSFADE_SR, ahora - inicio,
+                )
+                ultimo_log = ahora
+    logger.info("Audio con crossfade escrito en %.1fs.", time.monotonic() - inicio)
 
 
 def _resample_to_length(audio: "np.ndarray", target_length: int) -> "np.ndarray":
@@ -1961,7 +2069,7 @@ def apply_cuts_with_zoom(video_id: str, cuts: list[dict], config: dict) -> str:
     return str(result_path)
 
 
-def _measure_loudness(path: str) -> dict | None:
+def _measure_loudness(path: str, total_duration_s: float | None = None) -> dict | None:
     """Primera pasada de loudnorm (solo análisis): devuelve las medidas en JSON, o None si no se pudieron parsear."""
     cmd = [
         "ffmpeg", "-i", path, "-vn",
@@ -1969,11 +2077,20 @@ def _measure_loudness(path: str) -> dict | None:
         f"loudnorm=I={_LOUDNORM_TARGET_I}:TP={_LOUDNORM_TARGET_TP}:LRA={_LOUDNORM_TARGET_LRA}:print_format=json",
         "-f", "null", "-",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        stderr_text = _run_ffmpeg_streaming(
+            cmd, description="Midiendo sonoridad (loudnorm, primera pasada)", total_duration_s=total_duration_s
+        )
+    except RuntimeError:
+        # Igual que antes (subprocess.run sin comprobar returncode): un
+        # fallo en la MEDICIÓN no es fatal, solo hace que se caiga a
+        # loudnorm en modo una-sola-pasada (ver _build_loudnorm_filter).
+        logger.warning("ffmpeg falló midiendo la sonoridad; se omite la normalización de dos pasadas.")
+        return None
     # El bloque JSON de loudnorm no es necesariamente lo último en stderr
     # (ffmpeg suele imprimir un resumen de muxing/tamaño después); se busca
     # el ÚLTIMO bloque {...} en todo el stderr en vez de anclarlo al final.
-    matches = re.findall(r"\{[^{}]*\}", result.stderr)
+    matches = re.findall(r"\{[^{}]*\}", stderr_text)
     if not matches:
         logger.warning("No se pudo leer la medición de sonoridad de ffmpeg loudnorm; se omite la normalización.")
         return None
@@ -2019,7 +2136,8 @@ def normalize_audio(clip_path: str, config: dict) -> str:
         logger.info("loudnorm desactivado en config; se omite la normalización de audio.")
         return clip_path
 
-    measured = _measure_loudness(clip_path)
+    total_duration_s = _video_info(Path(clip_path))["duration"]
+    measured = _measure_loudness(clip_path, total_duration_s)
     output_path = str(Path(clip_path).with_name("_normalized.mp4"))
     loudnorm_filter = _build_loudnorm_filter(measured)
 
@@ -2031,7 +2149,7 @@ def normalize_audio(clip_path: str, config: dict) -> str:
         "-movflags", "+faststart",
         output_path,
     ]
-    _run_ffmpeg(cmd, description="Normalizando audio (loudnorm, dos pasadas)")
+    _run_ffmpeg(cmd, description="Normalizando audio (loudnorm, segunda pasada)", total_duration_s=total_duration_s)
 
     return output_path
 
