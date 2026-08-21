@@ -1388,6 +1388,12 @@ def _glue_video_files(paths: list[Path], out_path: Path) -> None:
 _CROSSFADE_SR = 48000
 _CROSSFADE_CHANNELS = 2
 
+# Umbral (muestras) por debajo del cual _resample_to_length usa el atajo de
+# repetir/recortar la cola en vez de interpolar el array completo -- ver ese
+# docstring. 100ms a _CROSSFADE_SR, el mismo margen de sincronía ya aceptado
+# en la validación por coincidencia de contenido de este pipeline.
+_RESAMPLE_TINY_DIFF_SAMPLES = round(_CROSSFADE_SR * 0.1)
+
 # El bucle de decodificación de _decode_fragment_groups lanza un
 # proceso ffmpeg por fragmento (pueden ser cientos en una grabación larga)
 # sin ninguna otra señal de progreso -- en una ejecución real contra un
@@ -1618,6 +1624,17 @@ def _write_crossfaded_audio(
     inicio = time.monotonic()
     audio = _local_crossfade_concat(groups, crossfade_ms, target_lengths)
     logger.info("Crossfades mezclados en %.1fs.", time.monotonic() - inicio)
+    # `groups` (los fragmentos de audio ya decodificados, en conjunto del
+    # mismo orden de magnitud que `audio`) ya no hace falta -- liberarlo
+    # explícitamente ANTES del reestirado global reduce el pico de memoria
+    # de ese paso (varios arrays float64 del tamaño del audio completo,
+    # ver _resample_to_length) en vez de dejarlo vivo sin usarse el resto
+    # de la función. Encontrado necesario en producción (witchfire_4, 811
+    # fragmentos/9098s): el paso siguiente mataba el proceso en background
+    # de forma reproducible (2/2 intentos) incluso sin el límite de
+    # recursos del sandbox del propio Bash tool ya descartado como causa
+    # (ver status.md/memoria -- witchfire_3 sí se arregló solo con eso).
+    del groups
 
     total_target_length = round(total_target_duration_s * _CROSSFADE_SR)
     inicio = time.monotonic()
@@ -1695,6 +1712,26 @@ def _resample_to_length(audio: "np.ndarray", target_length: int) -> "np.ndarray"
 
     if len(audio) == 0 or target_length <= 0 or len(audio) == target_length:
         return audio
+
+    diff = target_length - len(audio)
+    if abs(diff) <= _RESAMPLE_TINY_DIFF_SAMPLES:
+        # Atajo para el caso NORMAL/ESPERADO (ver docstring: "unas pocas
+        # muestras... normalmente un no-op o casi"): por debajo de
+        # _RESAMPLE_TINY_DIFF_SAMPLES (100ms a _CROSSFADE_SR -- bien
+        # dentro del margen de sincronía ya aceptado en todo este
+        # pipeline, <50-100ms, ver validación por coincidencia de
+        # contenido) repetir/recortar la cola es indistinguible en la
+        # práctica de una interpolación completa, y evita construir
+        # old_idx/new_idx (float64, tamaño de audio completo -- varios GB
+        # en un vídeo de 1-2h) solo para una corrección mínima. Si la
+        # discrepancia real es mayor (fuera de lo que este mecanismo
+        # debería producir nunca; ver más abajo), se cae al camino
+        # completo de interpolación de siempre, sin perder precisión.
+        if diff > 0:
+            pad = np.repeat(audio[-1:], diff, axis=0)
+            return np.concatenate([audio, pad], axis=0)
+        return audio[:target_length].copy()
+
     old_idx = np.linspace(0.0, 1.0, num=len(audio), endpoint=True)
     new_idx = np.linspace(0.0, 1.0, num=target_length, endpoint=True)
     stretched = np.empty((target_length, audio.shape[1]), dtype=np.float32)

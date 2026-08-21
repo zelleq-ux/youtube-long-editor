@@ -2,7 +2,11 @@ ffmpeg-python>=0.2.0
 faster-whisper>=1.0.0
 anthropic>=0.40.0
 opencv-python>=4.9.0
-librosa>=0.10.0
+librosa>=0.10.0,<1.0.0  # 1.0.0 elimina el fallback interno a audioread (librosa/core/audio.py:__soundfile_load
+                        # ya no tiene try/except), y soundfile/libsndfile no sabe abrir contenedores mp4 --
+                        # detect_cuts.detect_silence_segments() siempre depende de ese fallback para los raws
+                        # de OBS (mp4/AAC). Encontrado 2026-08-21 al recrear el venv desde cero tras la
+                        # migración a D: (pip instaló 1.0.0 al no haber tope superior); revertido a 0.11.0.
 pyyaml>=6.0
 python-dotenv>=1.0.0
 pydantic>=2.0.0
